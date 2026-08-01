@@ -11,8 +11,8 @@ pub use binder::{
     RoutineBodyCheckpoint, SemanticBinder, UnresolvedTypeForward,
 };
 pub use expressions::{
-    BoundApplicationTarget, BoundBody, BoundExpression, BoundExpressionKind, BoundStatement,
-    BoundStatementKind,
+    BoundApplicationTarget, BoundBody, BoundCaseArm, BoundCaseLabel, BoundExceptionHandler,
+    BoundExpression, BoundExpressionKind, BoundStatement, BoundStatementKind, BoundTryContinuation,
 };
 pub use frontend::{BoundFile, SemanticCompilation, bind_sources};
 pub use ids::{

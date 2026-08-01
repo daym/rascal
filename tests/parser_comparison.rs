@@ -137,6 +137,7 @@ fn every_plan_operator_uses_the_common_application_node() {
             Statement::Expression(expression) => application(expression),
             Statement::Assignment(application) => application,
             Statement::Error(span) => panic!("operator failed to parse at {span:?}"),
+            structured => panic!("unexpected structured statement: {structured:?}"),
         };
         assert_eq!(
             application.callee,

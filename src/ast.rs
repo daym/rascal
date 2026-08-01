@@ -196,7 +196,151 @@ impl Expr {
 pub enum Statement {
     Expression(Expr),
     Assignment(Application),
+    Compound {
+        statements: Vec<Statement>,
+        span: Span,
+    },
+    If {
+        condition: Expr,
+        then_branch: Box<Statement>,
+        else_branch: Option<Box<Statement>>,
+        span: Span,
+    },
+    While {
+        condition: Expr,
+        body: Box<Statement>,
+        span: Span,
+    },
+    Repeat {
+        body: Vec<Statement>,
+        condition: Expr,
+        span: Span,
+    },
+    For {
+        control: String,
+        initial: Expr,
+        direction: ForDirection,
+        final_value: Expr,
+        body: Box<Statement>,
+        span: Span,
+        modes: ModeSnapshot,
+    },
+    ForIn {
+        control: String,
+        source: Expr,
+        body: Box<Statement>,
+        span: Span,
+        modes: ModeSnapshot,
+    },
+    Case {
+        selector: Expr,
+        arms: Vec<CaseArm>,
+        otherwise: Vec<Statement>,
+        span: Span,
+    },
+    With {
+        receivers: Vec<Expr>,
+        body: Box<Statement>,
+        span: Span,
+    },
+    Try {
+        body: Vec<Statement>,
+        continuation: TryContinuation,
+        span: Span,
+    },
+    Raise {
+        value: Option<Expr>,
+        address: Option<Expr>,
+        frame: Option<Expr>,
+        span: Span,
+    },
+    Goto {
+        label: String,
+        span: Span,
+    },
+    Label {
+        label: String,
+        statement: Box<Statement>,
+        span: Span,
+    },
+    Break(Span),
+    Continue(Span),
+    Exit {
+        value: Option<Expr>,
+        span: Span,
+    },
+    InlineVariable {
+        names: Vec<String>,
+        type_name: Option<Vec<String>>,
+        initializer: Option<Expr>,
+        modes: ModeSnapshot,
+        span: Span,
+    },
+    Empty(Span),
     Error(Span),
+}
+
+impl Statement {
+    pub fn span(&self) -> Span {
+        match self {
+            Self::Expression(expression) => expression.span.clone(),
+            Self::Assignment(application) => application.span.clone(),
+            Self::Compound { span, .. }
+            | Self::If { span, .. }
+            | Self::While { span, .. }
+            | Self::Repeat { span, .. }
+            | Self::For { span, .. }
+            | Self::ForIn { span, .. }
+            | Self::Case { span, .. }
+            | Self::With { span, .. }
+            | Self::Try { span, .. }
+            | Self::Raise { span, .. }
+            | Self::Goto { span, .. }
+            | Self::Label { span, .. }
+            | Self::Break(span)
+            | Self::Continue(span)
+            | Self::Exit { span, .. }
+            | Self::InlineVariable { span, .. }
+            | Self::Empty(span)
+            | Self::Error(span) => span.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForDirection {
+    To,
+    DownTo,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CaseLabel {
+    Value(Expr),
+    Range { low: Expr, high: Expr },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaseArm {
+    pub labels: Vec<CaseLabel>,
+    pub statement: Statement,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TryContinuation {
+    Finally(Vec<Statement>),
+    Except {
+        handlers: Vec<ExceptionHandler>,
+        otherwise: Vec<Statement>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExceptionHandler {
+    pub variable: Option<String>,
+    pub exception_type: String,
+    pub body: Statement,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    Application, Callee, Diagnostic, Expr, ExprKind, Literal, Operator, PascalFile, PascalFileKind,
-    PascalSectionKind, Span, Statement, Token, chumsky_parser,
+    Application, Callee, CaseLabel, Diagnostic, Expr, ExprKind, Literal, Operator, PascalFile,
+    PascalFileKind, PascalSectionKind, Span, Statement, Token, TryContinuation, chumsky_parser,
     declaration_ast::{
         AggregateSyntaxKind, CallingConventionSyntax, DeclarationSyntax, FormalModeSyntax,
         RoutineDeclarationSyntax, RoutineSyntaxKind, SpannedName, TypeDeclarationSyntax,
@@ -14,14 +14,15 @@ use crate::{
 
 use super::{
     AggregateDefinition, AggregateKind, AliasType, ArrayType, BindError, BoundApplicationTarget,
-    BoundBody, BoundExpression, BoundExpressionKind, BoundStatement, BoundStatementKind,
-    CallableFlavor, CallableType, CallingConvention, Capture, ConversionRank, DeclarationMode,
-    DeclarationState, DeclaredRoutine, EnvironmentId, EnvironmentRequirement, FieldLayout,
-    FormalParameter, FrameKind, IncompleteReason, LookupEdge, LookupRequest, LookupResult, NameId,
-    NodeId, OpaqueType, ParameterMode, PointerType, PrimitiveKind, PrimitiveType, RegionOwner,
-    RoutineOwner, RoutineSignature, ScopeGraph, SemanticBinder, StorageLayout, SymbolId,
-    SymbolKind, TypeOwner, TypeRef, UnitGraphError, UnitId, UnitPhase, UnitRegistry,
-    ValueConversion,
+    BoundBody, BoundCaseArm, BoundCaseLabel, BoundExceptionHandler, BoundExpression,
+    BoundExpressionKind, BoundStatement, BoundStatementKind, BoundTryContinuation, CallableFlavor,
+    CallableType, CallingConvention, Capture, ConversionRank, DeclarationMode, DeclarationState,
+    DeclaredRoutine, EnvironmentId, EnvironmentRequirement, FieldLayout, FormalParameter,
+    FrameKind, IncompleteReason, LookupBarrier, LookupEdge, LookupRequest, LookupResult, NameId,
+    NodeId, OpaqueType, ParameterMode, PointerType, PrimitiveKind, PrimitiveType, ReceiverId,
+    RegionOwner, RoutineOwner, RoutineSignature, ScopeGraph, SemanticBinder, StorageLayout,
+    SymbolCategory, SymbolFilter, SymbolId, SymbolKind, TypeOwner, TypeRef, UnitGraphError, UnitId,
+    UnitPhase, UnitRegistry, ValueConversion,
 };
 
 #[derive(Clone, Debug)]
@@ -83,6 +84,9 @@ struct CompilationDriver {
     system_exports: EnvironmentId,
     routine_forwards: BTreeMap<(super::RegionId, NameId), DeclaredRoutine>,
     next_anonymous_type: usize,
+    next_receiver: usize,
+    next_block: u32,
+    loop_depth: u32,
 }
 
 impl CompilationDriver {
@@ -110,6 +114,9 @@ impl CompilationDriver {
             system_exports,
             routine_forwards: BTreeMap::new(),
             next_anonymous_type: 0,
+            next_receiver: 0,
+            next_block: 0,
+            loop_depth: 0,
         }
     }
 
@@ -814,10 +821,581 @@ impl CompilationDriver {
                 span: application.span.clone(),
                 kind: BoundStatementKind::Assignment(self.bind_application(application, owner)),
             },
+            Statement::Compound { statements, span } => BoundStatement {
+                span: span.clone(),
+                kind: BoundStatementKind::Compound(self.bind_scoped_statements(statements, owner)),
+            },
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+                span,
+            } => {
+                let condition = self.bind_condition(condition, owner);
+                let then_branch = Box::new(self.bind_scoped_statement(then_branch, owner));
+                let else_branch = else_branch
+                    .as_deref()
+                    .map(|branch| Box::new(self.bind_scoped_statement(branch, owner)));
+                BoundStatement {
+                    span: span.clone(),
+                    kind: BoundStatementKind::If {
+                        condition,
+                        then_branch,
+                        else_branch,
+                    },
+                }
+            }
+            Statement::While {
+                condition,
+                body,
+                span,
+            } => BoundStatement {
+                span: span.clone(),
+                kind: BoundStatementKind::While {
+                    condition: self.bind_condition(condition, owner),
+                    body: Box::new(self.bind_loop_body(body, owner)),
+                },
+            },
+            Statement::Repeat {
+                body,
+                condition,
+                span,
+            } => BoundStatement {
+                span: span.clone(),
+                kind: BoundStatementKind::Repeat {
+                    body: self.bind_loop_statements(body, owner),
+                    condition: self.bind_condition(condition, owner),
+                },
+            },
+            Statement::For {
+                control,
+                initial,
+                direction,
+                final_value,
+                body,
+                span,
+                modes,
+            } => {
+                let control = self.lookup_control_variable(control, span.clone());
+                let initial = self.bind_expression(initial, owner);
+                let final_value = self.bind_expression(final_value, owner);
+                if let Some(symbol) = control {
+                    let control_type = self.binder.scopes.symbol(symbol).kind.ty();
+                    for value in [&initial, &final_value] {
+                        if control_type
+                            .zip(value.ty)
+                            .is_none_or(|(destination, source)| {
+                                self.binder
+                                    .types
+                                    .value_conversion(destination, source)
+                                    .is_none()
+                            })
+                        {
+                            self.diagnostics.push(Diagnostic::new(
+                                value.span.clone(),
+                                "for-loop bound is not convertible to the control type",
+                            ));
+                        }
+                    }
+                }
+                BoundStatement {
+                    span: span.clone(),
+                    kind: BoundStatementKind::For {
+                        control,
+                        initial,
+                        direction: *direction,
+                        final_value,
+                        body: Box::new(self.bind_loop_body(body, owner)),
+                        modes: *modes,
+                    },
+                }
+            }
+            Statement::ForIn {
+                control,
+                source,
+                body,
+                span,
+                modes,
+            } => {
+                let control = self.lookup_control_variable(control, span.clone());
+                let source = self.bind_expression(source, owner);
+                let element = source
+                    .ty
+                    .and_then(|ty| self.binder.types.sequence_element_type(ty));
+                if element.is_none() {
+                    self.diagnostics.push(Diagnostic::new(
+                        source.span.clone(),
+                        "for-in source is not a sequence",
+                    ));
+                } else if let Some(symbol) = control {
+                    let control_type = self.binder.scopes.symbol(symbol).kind.ty();
+                    if control_type
+                        .zip(element)
+                        .is_none_or(|(destination, source)| {
+                            self.binder
+                                .types
+                                .value_conversion(destination, source)
+                                .is_none()
+                        })
+                    {
+                        self.diagnostics.push(Diagnostic::new(
+                            span.clone(),
+                            "for-in element is not convertible to the control type",
+                        ));
+                    }
+                }
+                BoundStatement {
+                    span: span.clone(),
+                    kind: BoundStatementKind::ForIn {
+                        control,
+                        source,
+                        body: Box::new(self.bind_loop_body(body, owner)),
+                        modes: *modes,
+                    },
+                }
+            }
+            Statement::Case {
+                selector,
+                arms,
+                otherwise,
+                span,
+            } => {
+                let selector = self.bind_expression(selector, owner);
+                let arms = arms
+                    .iter()
+                    .map(|arm| BoundCaseArm {
+                        labels: arm
+                            .labels
+                            .iter()
+                            .map(|label| match label {
+                                CaseLabel::Value(value) => {
+                                    BoundCaseLabel::Value(self.bind_expression(value, owner))
+                                }
+                                CaseLabel::Range { low, high } => BoundCaseLabel::Range {
+                                    low: self.bind_expression(low, owner),
+                                    high: self.bind_expression(high, owner),
+                                },
+                            })
+                            .collect(),
+                        statement: self.bind_scoped_statement(&arm.statement, owner),
+                        span: arm.span.clone(),
+                    })
+                    .collect();
+                let otherwise = otherwise
+                    .iter()
+                    .map(|statement| self.bind_statement(statement, owner))
+                    .collect();
+                BoundStatement {
+                    span: span.clone(),
+                    kind: BoundStatementKind::Case {
+                        selector,
+                        arms,
+                        otherwise,
+                    },
+                }
+            }
+            Statement::With {
+                receivers,
+                body,
+                span,
+            } => {
+                let receivers = receivers
+                    .iter()
+                    .map(|receiver| self.bind_expression(receiver, owner))
+                    .collect::<Vec<_>>();
+                let mut edges = Vec::new();
+                for receiver in &receivers {
+                    let Some(environment) = receiver
+                        .ty
+                        .and_then(|ty| self.binder.types.member_environment(ty))
+                    else {
+                        self.diagnostics.push(Diagnostic::new(
+                            receiver.span.clone(),
+                            "with receiver has no members",
+                        ));
+                        continue;
+                    };
+                    let receiver_id = ReceiverId::from_index(self.next_receiver);
+                    self.next_receiver += 1;
+                    edges.push(LookupEdge::with_receiver(environment, receiver_id));
+                }
+                edges.reverse();
+                let checkpoint = self.binder.scopes.push_overlay(edges);
+                let body = Box::new(self.bind_scoped_statement(body, owner));
+                self.binder.scopes.restore_environment(checkpoint);
+                BoundStatement {
+                    span: span.clone(),
+                    kind: BoundStatementKind::With { receivers, body },
+                }
+            }
+            Statement::Try {
+                body,
+                continuation,
+                span,
+            } => {
+                let body = body
+                    .iter()
+                    .map(|statement| self.bind_statement(statement, owner))
+                    .collect();
+                let continuation = match continuation {
+                    TryContinuation::Finally(statements) => BoundTryContinuation::Finally(
+                        statements
+                            .iter()
+                            .map(|statement| self.bind_statement(statement, owner))
+                            .collect(),
+                    ),
+                    TryContinuation::Except {
+                        handlers,
+                        otherwise,
+                    } => BoundTryContinuation::Except {
+                        handlers: handlers
+                            .iter()
+                            .map(|handler| self.bind_exception_handler(handler, owner))
+                            .collect(),
+                        otherwise: otherwise
+                            .iter()
+                            .map(|statement| self.bind_statement(statement, owner))
+                            .collect(),
+                    },
+                };
+                BoundStatement {
+                    span: span.clone(),
+                    kind: BoundStatementKind::Try { body, continuation },
+                }
+            }
+            Statement::Raise {
+                value,
+                address,
+                frame,
+                span,
+            } => BoundStatement {
+                span: span.clone(),
+                kind: BoundStatementKind::Raise {
+                    value: value
+                        .as_ref()
+                        .map(|value| self.bind_expression(value, owner)),
+                    address: address
+                        .as_ref()
+                        .map(|address| self.bind_expression(address, owner)),
+                    frame: frame
+                        .as_ref()
+                        .map(|frame| self.bind_expression(frame, owner)),
+                },
+            },
+            Statement::Goto { label, span } => BoundStatement {
+                span: span.clone(),
+                kind: BoundStatementKind::Goto {
+                    label: self.lookup_label(label, span.clone()),
+                },
+            },
+            Statement::Label {
+                label,
+                statement,
+                span,
+            } => BoundStatement {
+                span: span.clone(),
+                kind: BoundStatementKind::Label {
+                    label: self.lookup_label(label, span.clone()),
+                    statement: Box::new(self.bind_statement(statement, owner)),
+                },
+            },
+            Statement::Break(span) => {
+                if self.loop_depth == 0 {
+                    self.diagnostics
+                        .push(Diagnostic::new(span.clone(), "`break` used outside a loop"));
+                }
+                BoundStatement {
+                    span: span.clone(),
+                    kind: BoundStatementKind::Break,
+                }
+            }
+            Statement::Continue(span) => {
+                if self.loop_depth == 0 {
+                    self.diagnostics.push(Diagnostic::new(
+                        span.clone(),
+                        "`continue` used outside a loop",
+                    ));
+                }
+                BoundStatement {
+                    span: span.clone(),
+                    kind: BoundStatementKind::Continue,
+                }
+            }
+            Statement::Exit { value, span } => {
+                let value = value
+                    .as_ref()
+                    .map(|value| self.bind_expression(value, owner));
+                let result = owner
+                    .and_then(|owner| self.binder.types.callable(owner))
+                    .and_then(|callable| callable.signature.result);
+                match (result, value.as_ref().and_then(|value| value.ty)) {
+                    (Some(destination), Some(source))
+                        if self
+                            .binder
+                            .types
+                            .value_conversion(destination, source)
+                            .is_none() =>
+                    {
+                        self.diagnostics.push(Diagnostic::new(
+                            span.clone(),
+                            "exit value is not convertible to the function result",
+                        ));
+                    }
+                    (None, Some(_)) => self.diagnostics.push(Diagnostic::new(
+                        span.clone(),
+                        "procedure exit cannot carry a result value",
+                    )),
+                    (Some(_), None) if value.is_some() => self.diagnostics.push(Diagnostic::new(
+                        span.clone(),
+                        "exit result has no semantic type",
+                    )),
+                    _ => {}
+                }
+                BoundStatement {
+                    span: span.clone(),
+                    kind: BoundStatementKind::Exit(value),
+                }
+            }
+            Statement::InlineVariable {
+                names,
+                type_name,
+                initializer,
+                modes,
+                span,
+            } => {
+                let initializer = initializer
+                    .as_ref()
+                    .map(|initializer| self.bind_expression(initializer, owner));
+                let explicit_type = type_name
+                    .as_ref()
+                    .and_then(|path| self.resolve_type_path_strings(path, span.clone()));
+                let ty = explicit_type
+                    .or_else(|| initializer.as_ref().and_then(|initializer| initializer.ty));
+                let Some(ty) = ty else {
+                    self.diagnostics.push(Diagnostic::new(
+                        span.clone(),
+                        "inline variable requires a resolvable type or initializer",
+                    ));
+                    return BoundStatement {
+                        span: span.clone(),
+                        kind: BoundStatementKind::InlineVariable {
+                            symbols: Vec::new(),
+                            initializer,
+                            modes: *modes,
+                        },
+                    };
+                };
+                if let (Some(destination), Some(source)) = (
+                    explicit_type,
+                    initializer.as_ref().and_then(|initializer| initializer.ty),
+                ) && self
+                    .binder
+                    .types
+                    .value_conversion(destination, source)
+                    .is_none()
+                {
+                    self.diagnostics.push(Diagnostic::new(
+                        span.clone(),
+                        "inline initializer is not convertible to its declared type",
+                    ));
+                }
+                let block = self.next_block;
+                self.next_block += 1;
+                let _ = self.binder.scopes.enter_region(RegionOwner::Block(block));
+                let mut symbols = Vec::new();
+                for spelling in names {
+                    let name = self.binder.scopes.intern_name(spelling);
+                    match self.binder.scopes.declare(
+                        name,
+                        SymbolKind::Variable(ty),
+                        DeclarationState::Complete,
+                        DeclarationMode::Fresh,
+                    ) {
+                        Ok(symbol) => symbols.push(symbol),
+                        Err(error) => self.bind_error(span.clone(), error.into()),
+                    }
+                }
+                BoundStatement {
+                    span: span.clone(),
+                    kind: BoundStatementKind::InlineVariable {
+                        symbols,
+                        initializer,
+                        modes: *modes,
+                    },
+                }
+            }
+            Statement::Empty(span) => BoundStatement {
+                span: span.clone(),
+                kind: BoundStatementKind::Empty,
+            },
             Statement::Error(span) => BoundStatement {
                 span: span.clone(),
                 kind: BoundStatementKind::Error,
             },
+        }
+    }
+
+    fn bind_loop_body(&mut self, statement: &Statement, owner: Option<TypeRef>) -> BoundStatement {
+        self.loop_depth += 1;
+        let result = self.bind_scoped_statement(statement, owner);
+        self.loop_depth -= 1;
+        result
+    }
+
+    fn bind_loop_statements(
+        &mut self,
+        statements: &[Statement],
+        owner: Option<TypeRef>,
+    ) -> Vec<BoundStatement> {
+        self.loop_depth += 1;
+        let result = self.bind_scoped_statements(statements, owner);
+        self.loop_depth -= 1;
+        result
+    }
+
+    fn bind_scoped_statement(
+        &mut self,
+        statement: &Statement,
+        owner: Option<TypeRef>,
+    ) -> BoundStatement {
+        let block = self.next_block;
+        self.next_block += 1;
+        let (_, checkpoint) = self.binder.scopes.enter_region(RegionOwner::Block(block));
+        let result = self.bind_statement(statement, owner);
+        self.binder.scopes.exit_region(checkpoint);
+        result
+    }
+
+    fn bind_scoped_statements(
+        &mut self,
+        statements: &[Statement],
+        owner: Option<TypeRef>,
+    ) -> Vec<BoundStatement> {
+        let block = self.next_block;
+        self.next_block += 1;
+        let (_, checkpoint) = self.binder.scopes.enter_region(RegionOwner::Block(block));
+        let result = statements
+            .iter()
+            .map(|statement| self.bind_statement(statement, owner))
+            .collect();
+        self.binder.scopes.exit_region(checkpoint);
+        result
+    }
+
+    fn bind_condition(&mut self, expression: &Expr, owner: Option<TypeRef>) -> BoundExpression {
+        let condition = self.bind_expression(expression, owner);
+        if condition.ty.is_none_or(|source| {
+            self.binder
+                .types
+                .value_conversion(self.builtins.boolean, source)
+                .is_none()
+        }) {
+            self.diagnostics.push(Diagnostic::new(
+                expression.span.clone(),
+                "condition is not Boolean-compatible",
+            ));
+        }
+        condition
+    }
+
+    fn lookup_control_variable(&mut self, spelling: &str, span: Span) -> Option<SymbolId> {
+        let name = self.binder.scopes.intern_name(spelling);
+        let result = self.binder.scopes.lookup_symbol(
+            self.binder.scopes.current_environment(),
+            name,
+            LookupRequest {
+                accepted: SymbolFilter::Category(SymbolCategory::Variable),
+                barrier: LookupBarrier::AnyDeclaration,
+            },
+        );
+        let symbol = result.and_then(|result| result.primary.first().map(|hit| hit.symbol));
+        if symbol.is_none()
+            || !symbol.is_some_and(|symbol| {
+                matches!(
+                    self.binder.scopes.symbol(symbol).kind,
+                    SymbolKind::Variable(_)
+                )
+            })
+        {
+            self.diagnostics.push(Diagnostic::new(
+                span,
+                format!("for-loop control `{spelling}` is not a variable"),
+            ));
+            return None;
+        }
+        symbol
+    }
+
+    fn lookup_label(&mut self, spelling: &str, span: Span) -> Option<SymbolId> {
+        let name = self.binder.scopes.intern_name(spelling);
+        let result = self.binder.scopes.lookup_symbol(
+            self.binder.scopes.current_environment(),
+            name,
+            LookupRequest {
+                accepted: SymbolFilter::Category(SymbolCategory::Label),
+                barrier: LookupBarrier::AcceptedDeclaration,
+            },
+        );
+        let symbol = result.and_then(|result| result.primary.first().map(|hit| hit.symbol));
+        if symbol.is_none() {
+            self.diagnostics
+                .push(Diagnostic::new(span, format!("unknown label `{spelling}`")));
+        }
+        symbol
+    }
+
+    fn bind_exception_handler(
+        &mut self,
+        handler: &crate::ExceptionHandler,
+        owner: Option<TypeRef>,
+    ) -> BoundExceptionHandler {
+        let exception_name = self.binder.scopes.intern_name(&handler.exception_type);
+        let exception_type = self
+            .binder
+            .scopes
+            .lookup_symbol(
+                self.binder.scopes.current_environment(),
+                exception_name,
+                LookupRequest::REQUIRED_TYPE,
+            )
+            .and_then(|result| {
+                self.binder
+                    .scopes
+                    .symbol(result.primary[0].symbol)
+                    .kind
+                    .ty()
+            });
+        if exception_type.is_none() {
+            self.diagnostics.push(Diagnostic::new(
+                handler.span.clone(),
+                format!("unknown exception type `{}`", handler.exception_type),
+            ));
+        }
+
+        let block = self.next_block;
+        self.next_block += 1;
+        let (_, checkpoint) = self.binder.scopes.enter_region(RegionOwner::Block(block));
+        let variable = handler.variable.as_ref().and_then(|variable| {
+            let ty = exception_type?;
+            let name = self.binder.scopes.intern_name(variable);
+            self.binder
+                .scopes
+                .declare(
+                    name,
+                    SymbolKind::Variable(ty),
+                    DeclarationState::Complete,
+                    DeclarationMode::Fresh,
+                )
+                .map_err(|error| self.bind_error(handler.span.clone(), error.into()))
+                .ok()
+        });
+        let body = self.bind_statement(&handler.body, owner);
+        self.binder.scopes.exit_region(checkpoint);
+        BoundExceptionHandler {
+            variable,
+            exception_type,
+            body,
+            span: handler.span.clone(),
         }
     }
 
@@ -964,6 +1542,7 @@ impl CompilationDriver {
             return bound_error(span);
         };
         let symbol = result.primary[0].symbol;
+        let receiver = result.primary[0].receiver;
         let kind = self.binder.scopes.symbol(symbol).kind.clone();
         if matches!(kind, SymbolKind::Type(_)) && !permit_type {
             self.diagnostics.push(Diagnostic::new(
@@ -974,7 +1553,7 @@ impl CompilationDriver {
         self.note_capture(owner, symbol);
         BoundExpression {
             ty: kind.ty(),
-            kind: BoundExpressionKind::Symbol { symbol },
+            kind: BoundExpressionKind::Symbol { symbol, receiver },
             span,
         }
     }
@@ -1018,7 +1597,7 @@ impl CompilationDriver {
                     };
                 };
                 let symbol = match callee.kind {
-                    BoundExpressionKind::Symbol { symbol }
+                    BoundExpressionKind::Symbol { symbol, .. }
                     | BoundExpressionKind::Member { symbol, .. } => Some(symbol),
                     _ => None,
                 };
@@ -1032,6 +1611,7 @@ impl CompilationDriver {
                         target: BoundApplicationTarget::CallableValue {
                             symbol,
                             callable_type,
+                            receiver: None,
                         },
                         operands,
                     },
@@ -1065,6 +1645,7 @@ impl CompilationDriver {
             return bound_application_error(span, operands);
         };
         let primary = result.primary[0].symbol;
+        let primary_receiver = result.primary[0].receiver;
         let primary_kind = self.binder.scopes.symbol(primary).kind.clone();
         match primary_kind {
             SymbolKind::Type(destination) => {
@@ -1109,6 +1690,14 @@ impl CompilationDriver {
                         target: BoundApplicationTarget::Routine {
                             candidates,
                             selected,
+                            receiver: selected.and_then(|selected| {
+                                result
+                                    .primary
+                                    .iter()
+                                    .chain(result.shadowed.iter().flatten())
+                                    .find(|hit| hit.symbol == selected)
+                                    .and_then(|hit| hit.receiver)
+                            }),
                         },
                         operands,
                     },
@@ -1130,6 +1719,7 @@ impl CompilationDriver {
                         target: BoundApplicationTarget::CallableValue {
                             symbol: Some(primary),
                             callable_type,
+                            receiver: primary_receiver,
                         },
                         operands,
                     },
@@ -1402,6 +1992,17 @@ impl CompilationDriver {
             ty = member_type;
         }
         Some(ty)
+    }
+
+    fn resolve_type_path_strings(&mut self, path: &[String], span: Span) -> Option<TypeRef> {
+        let path = path
+            .iter()
+            .map(|spelling| SpannedName {
+                spelling: spelling.clone(),
+                span: span.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.resolve_named_type(&path, span)
     }
 
     fn allocate_anonymous(&mut self, implementation: impl super::PascalType + 'static) -> TypeRef {

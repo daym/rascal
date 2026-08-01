@@ -199,27 +199,29 @@ mod tests {
     #[test]
     fn rightmost_use_wins_without_transitive_reexport() {
         let mut scopes = ScopeGraph::new();
-        let mut units = UnitRegistry::new();
+        let mut modules = ModuleRegistry::new();
         let x = scopes.intern_name("X");
 
-        let (_, a_start) = scopes.create_detached_region(RegionOwner::Unit(UnitId(0)), Vec::new());
+        let (_, a_start) =
+            scopes.create_detached_region(RegionOwner::Module(ModuleId(0)), Vec::new());
         let a_name = scopes.intern_name("A");
-        let a = units.add_unit(a_name, a_start);
+        let a = modules.add_module(a_name, a_start);
         let (a_exports, a_x) = declare_value(&mut scopes, a_start, x, TypeRef(1));
-        units.set_interface_exports(a, a_exports);
+        modules.set_interface_exports(a, a_exports);
 
-        let (_, b_start) = scopes.create_detached_region(RegionOwner::Unit(UnitId(1)), Vec::new());
+        let (_, b_start) =
+            scopes.create_detached_region(RegionOwner::Module(ModuleId(1)), Vec::new());
         let b_name = scopes.intern_name("B");
-        let b = units.add_unit(b_name, b_start);
+        let b = modules.add_module(b_name, b_start);
         let (b_exports, b_x) = declare_value(&mut scopes, b_start, x, TypeRef(2));
-        units.set_interface_exports(b, b_exports);
+        modules.set_interface_exports(b, b_exports);
 
         let (_, c_exports) =
-            scopes.create_detached_region(RegionOwner::Unit(UnitId(2)), Vec::new());
+            scopes.create_detached_region(RegionOwner::Module(ModuleId(2)), Vec::new());
         let c_name = scopes.intern_name("C");
-        let c = units.add_unit(c_name, c_exports);
-        units.set_uses(c, UnitPhase::Interface, vec![a, b]);
-        let lookup = units.interface_lookup_environment(&mut scopes, c, c_exports, None);
+        let c = modules.add_module(c_name, c_exports);
+        modules.set_uses(c, ModulePhase::Interface, vec![a, b]);
+        let lookup = modules.interface_lookup_environment(&mut scopes, c, c_exports, None);
 
         let result = scopes
             .lookup_symbol(lookup, x, LookupRequest::ORDINARY)
@@ -228,11 +230,11 @@ mod tests {
         assert_eq!(result.shadowed[0][0].symbol, a_x);
 
         let (_, d_exports) =
-            scopes.create_detached_region(RegionOwner::Unit(UnitId(3)), Vec::new());
+            scopes.create_detached_region(RegionOwner::Module(ModuleId(3)), Vec::new());
         let d_name = scopes.intern_name("D");
-        let d = units.add_unit(d_name, d_exports);
-        units.set_uses(d, UnitPhase::Interface, vec![c]);
-        let d_lookup = units.interface_lookup_environment(&mut scopes, d, d_exports, None);
+        let d = modules.add_module(d_name, d_exports);
+        modules.set_uses(d, ModulePhase::Interface, vec![c]);
+        let d_lookup = modules.interface_lookup_environment(&mut scopes, d, d_exports, None);
         assert!(
             scopes
                 .lookup_symbol(d_lookup, x, LookupRequest::ORDINARY)
@@ -243,22 +245,24 @@ mod tests {
     #[test]
     fn local_declaration_beats_imports() {
         let mut scopes = ScopeGraph::new();
-        let mut units = UnitRegistry::new();
+        let mut modules = ModuleRegistry::new();
         let x = scopes.intern_name("X");
 
-        let (_, a_start) = scopes.create_detached_region(RegionOwner::Unit(UnitId(0)), Vec::new());
+        let (_, a_start) =
+            scopes.create_detached_region(RegionOwner::Module(ModuleId(0)), Vec::new());
         let a_name = scopes.intern_name("A");
-        let a = units.add_unit(a_name, a_start);
+        let a = modules.add_module(a_name, a_start);
         let (a_exports, _) = declare_value(&mut scopes, a_start, x, TypeRef(1));
-        units.set_interface_exports(a, a_exports);
+        modules.set_interface_exports(a, a_exports);
 
-        let (_, b_start) = scopes.create_detached_region(RegionOwner::Unit(UnitId(1)), Vec::new());
+        let (_, b_start) =
+            scopes.create_detached_region(RegionOwner::Module(ModuleId(1)), Vec::new());
         let b_name = scopes.intern_name("B");
-        let b = units.add_unit(b_name, b_start);
+        let b = modules.add_module(b_name, b_start);
         let (b_exports, local_x) = declare_value(&mut scopes, b_start, x, TypeRef(2));
-        units.set_interface_exports(b, b_exports);
-        units.set_uses(b, UnitPhase::Interface, vec![a]);
-        let lookup = units.interface_lookup_environment(&mut scopes, b, b_exports, None);
+        modules.set_interface_exports(b, b_exports);
+        modules.set_uses(b, ModulePhase::Interface, vec![a]);
+        let lookup = modules.interface_lookup_environment(&mut scopes, b, b_exports, None);
 
         let result = scopes
             .lookup_symbol(lookup, x, LookupRequest::ORDINARY)
@@ -269,25 +273,25 @@ mod tests {
     #[test]
     fn interface_cycles_fail_but_implementation_cycles_are_accepted() {
         let mut scopes = ScopeGraph::new();
-        let mut units = UnitRegistry::new();
+        let mut modules = ModuleRegistry::new();
         let (_, a_exports) =
-            scopes.create_detached_region(RegionOwner::Unit(UnitId(0)), Vec::new());
+            scopes.create_detached_region(RegionOwner::Module(ModuleId(0)), Vec::new());
         let a_name = scopes.intern_name("A");
-        let a = units.add_unit(a_name, a_exports);
+        let a = modules.add_module(a_name, a_exports);
         let (_, b_exports) =
-            scopes.create_detached_region(RegionOwner::Unit(UnitId(1)), Vec::new());
+            scopes.create_detached_region(RegionOwner::Module(ModuleId(1)), Vec::new());
         let b_name = scopes.intern_name("B");
-        let b = units.add_unit(b_name, b_exports);
+        let b = modules.add_module(b_name, b_exports);
 
-        units.set_uses(a, UnitPhase::Implementation, vec![b]);
-        units.set_uses(b, UnitPhase::Implementation, vec![a]);
-        assert_eq!(units.interface_order().unwrap(), vec![a, b]);
+        modules.set_uses(a, ModulePhase::Implementation, vec![b]);
+        modules.set_uses(b, ModulePhase::Implementation, vec![a]);
+        assert_eq!(modules.interface_order().unwrap(), vec![a, b]);
 
-        units.set_uses(a, UnitPhase::Interface, vec![b]);
-        units.set_uses(b, UnitPhase::Interface, vec![a]);
+        modules.set_uses(a, ModulePhase::Interface, vec![b]);
+        modules.set_uses(b, ModulePhase::Interface, vec![a]);
         assert!(matches!(
-            units.interface_order(),
-            Err(UnitGraphError::InterfaceCycle { .. })
+            modules.interface_order(),
+            Err(ModuleGraphError::InterfaceCycle { .. })
         ));
     }
 }

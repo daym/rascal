@@ -11,6 +11,23 @@ pub struct StorageLayout {
     pub alignment: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrdinalDomain {
+    pub lower: i128,
+    pub upper: i128,
+}
+
+impl OrdinalDomain {
+    pub const fn contains(self, value: i128) -> bool {
+        value >= self.lower && value <= self.upper
+    }
+
+    pub fn cardinality(self) -> Option<u128> {
+        let width = self.upper.checked_sub(self.lower)?;
+        u128::try_from(width).ok()?.checked_add(1)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OpaqueType {
     pub layout: Option<StorageLayout>,
@@ -154,6 +171,14 @@ pub trait PascalType: Debug {
 
     fn same_formal_contract_as(&self, query: TypeQuery<'_>, other: TypeRef) -> bool {
         query.this == other
+    }
+
+    fn ordinal_domain(&self, _query: TypeQuery<'_>) -> Option<OrdinalDomain> {
+        None
+    }
+
+    fn ordinal_base_type(&self, query: TypeQuery<'_>) -> Option<TypeRef> {
+        self.ordinal_domain(query).map(|_| query.this)
     }
 
     fn sequence_element_type(&self, _query: TypeQuery<'_>) -> Option<TypeRef> {
@@ -371,6 +396,15 @@ impl TypeRegistry {
             })
     }
 
+    pub fn ordinal_domain(&self, ty: TypeRef) -> Option<OrdinalDomain> {
+        self.implementation(ty)?.ordinal_domain(self.query(ty))
+    }
+
+    pub fn ordinal_base_type(&self, ty: TypeRef) -> Option<TypeRef> {
+        self.implementation(ty)?
+            .ordinal_base_type(self.query(ty))
+    }
+
     pub fn sequence_element_type(&self, ty: TypeRef) -> Option<TypeRef> {
         self.implementation(ty)?
             .sequence_element_type(self.query(ty))
@@ -565,12 +599,9 @@ impl PascalType for PrimitiveType {
             return Some(ValueConversion::identity());
         }
         let source_type = query.types.canonical_type(source);
-        let source = query
-            .types
-            .implementation(source_type)?
-            .as_any()
-            .downcast_ref::<PrimitiveType>()?;
-        match (self.kind, source.kind) {
+        let source_implementation = query.types.implementation(source_type)?;
+        if let Some(source) = source_implementation.as_any().downcast_ref::<PrimitiveType>() {
+            return match (self.kind, source.kind) {
             (
                 PrimitiveKind::Integer {
                     bits: destination_bits,
@@ -586,6 +617,21 @@ impl PascalType for PrimitiveType {
             {
                 Some(ValueConversion {
                     rank: ConversionRank::Widening,
+                    operation: ValueConversionOperation::IntegerWiden,
+                    range_check: RangeCheck::None,
+                })
+            }
+            _ => None,
+            };
+        }
+        match self.kind {
+            PrimitiveKind::Integer { .. }
+                if source_implementation
+                    .ordinal_domain(query.types.query(source_type))
+                    .is_some() =>
+            {
+                Some(ValueConversion {
+                    rank: ConversionRank::Compatible,
                     operation: ValueConversionOperation::IntegerWiden,
                     range_check: RangeCheck::None,
                 })
@@ -616,6 +662,29 @@ impl PascalType for PrimitiveType {
                 })
             }
             _ => None,
+        }
+    }
+
+    fn ordinal_domain(&self, _query: TypeQuery<'_>) -> Option<OrdinalDomain> {
+        match self.kind {
+            PrimitiveKind::Integer { bits, signed } => {
+                if signed {
+                    let magnitude = 1_i128.checked_shl(u32::from(bits.saturating_sub(1)))?;
+                    Some(OrdinalDomain {
+                        lower: -magnitude,
+                        upper: magnitude - 1,
+                    })
+                } else {
+                    let upper = 1_i128.checked_shl(u32::from(bits))?.checked_sub(1)?;
+                    Some(OrdinalDomain { lower: 0, upper })
+                }
+            }
+            PrimitiveKind::Boolean => Some(OrdinalDomain { lower: 0, upper: 1 }),
+            PrimitiveKind::Character => Some(OrdinalDomain {
+                lower: 0,
+                upper: 255,
+            }),
+            PrimitiveKind::Real { .. } => None,
         }
     }
 }
@@ -669,6 +738,137 @@ impl PascalType for AliasType {
         (!self.nominal)
             .then(|| query.types.member_environment(self.target))
             .flatten()
+    }
+
+    fn ordinal_domain(&self, query: TypeQuery<'_>) -> Option<OrdinalDomain> {
+        (!self.nominal)
+            .then(|| query.types.ordinal_domain(self.target))
+            .flatten()
+    }
+
+    fn ordinal_base_type(&self, query: TypeQuery<'_>) -> Option<TypeRef> {
+        if self.nominal {
+            self.ordinal_domain(query).map(|_| query.this)
+        } else {
+            query.types.ordinal_base_type(self.target)
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct EnumMember {
+    pub name: NameId,
+    pub value: i128,
+}
+
+#[derive(Clone, Debug)]
+pub struct EnumType {
+    pub members: Vec<EnumMember>,
+    pub domain: OrdinalDomain,
+    pub layout: StorageLayout,
+}
+
+impl PascalType for EnumType {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn storage_layout(&self, _query: TypeQuery<'_>) -> Option<StorageLayout> {
+        Some(self.layout)
+    }
+
+    fn ordinal_domain(&self, _query: TypeQuery<'_>) -> Option<OrdinalDomain> {
+        Some(self.domain)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SubrangeType {
+    pub base: TypeRef,
+    pub domain: OrdinalDomain,
+    pub layout: StorageLayout,
+}
+
+impl PascalType for SubrangeType {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn storage_layout(&self, _query: TypeQuery<'_>) -> Option<StorageLayout> {
+        Some(self.layout)
+    }
+
+    fn value_conversion_from(
+        &self,
+        query: TypeQuery<'_>,
+        source: TypeRef,
+    ) -> Option<ValueConversion> {
+        if query.this == source {
+            return Some(ValueConversion::identity());
+        }
+        (query.types.ordinal_base_type(source)? == query.types.ordinal_base_type(self.base)?)
+            .then_some(ValueConversion {
+                rank: ConversionRank::Compatible,
+                operation: ValueConversionOperation::IntegerWiden,
+                range_check: RangeCheck::TargetPolicy,
+            })
+    }
+
+    fn ordinal_domain(&self, _query: TypeQuery<'_>) -> Option<OrdinalDomain> {
+        Some(self.domain)
+    }
+
+    fn ordinal_base_type(&self, query: TypeQuery<'_>) -> Option<TypeRef> {
+        query.types.ordinal_base_type(self.base)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SetType {
+    pub element: TypeRef,
+    pub domain: OrdinalDomain,
+    pub layout: StorageLayout,
+}
+
+impl PascalType for SetType {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn storage_layout(&self, _query: TypeQuery<'_>) -> Option<StorageLayout> {
+        Some(self.layout)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct UnitType;
+
+impl PascalType for UnitType {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn storage_layout(&self, _query: TypeQuery<'_>) -> Option<StorageLayout> {
+        Some(StorageLayout {
+            size: 0,
+            alignment: 1,
+        })
     }
 }
 
@@ -1311,7 +1511,7 @@ mod tests {
             None,
             env(),
             CallableType {
-                owner: RoutineOwner::Unit,
+                owner: RoutineOwner::Module,
                 flavor,
                 signature: RoutineSignature {
                     parameters: vec![FormalParameter {

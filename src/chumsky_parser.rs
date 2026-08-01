@@ -817,6 +817,26 @@ pub fn parse_tokens(tokens: &[Token], end_of_source: usize) -> ParseOutput {
     parse_simple_segments(tokens, end_of_source)
 }
 
+pub fn parse_expression_tokens(
+    tokens: &[Token],
+    end_of_source: usize,
+) -> (Option<Expr>, Vec<Diagnostic>) {
+    let (expression, errors) = expression_parser()
+        .then_ignore(end())
+        .parse(tokens)
+        .into_output_errors();
+    let diagnostics = errors
+        .into_iter()
+        .map(|error| {
+            Diagnostic::new(
+                source_span(tokens, error.span().into_range(), end_of_source),
+                format!("chumsky expression: {error}"),
+            )
+        })
+        .collect();
+    (expression, diagnostics)
+}
+
 fn parse_simple_segments(tokens: &[Token], end_of_source: usize) -> ParseOutput {
     let mut statements = Vec::new();
     let mut diagnostics = Vec::new();

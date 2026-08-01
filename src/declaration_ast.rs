@@ -1,4 +1,4 @@
-use crate::{ModeSnapshot, Span, Token};
+use crate::{Expr, ModeSnapshot, Span, Token};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpannedName {
@@ -58,19 +58,51 @@ pub struct TypeSyntax {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnumMemberSyntax {
+    pub name: SpannedName,
+    pub value: Option<Expr>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VariantAlternativeSyntax {
+    pub labels: Vec<Expr>,
+    pub members: Vec<DeclarationSyntax>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VariantPartSyntax {
+    pub selector_name: Option<SpannedName>,
+    pub selector_type: Box<TypeSyntax>,
+    pub alternatives: Vec<VariantAlternativeSyntax>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TypeSyntaxKind {
     Named(Vec<SpannedName>),
     Pointer(Box<TypeSyntax>),
+    Enumeration(Vec<EnumMemberSyntax>),
+    Subrange {
+        lower: Expr,
+        upper: Expr,
+    },
     Aggregate {
         kind: AggregateSyntaxKind,
         base: Option<Box<TypeSyntax>>,
         members: Vec<DeclarationSyntax>,
+        variant: Option<Box<VariantPartSyntax>>,
     },
     Procedural {
         method_pointer: bool,
+        parameters: Vec<FormalParameterSyntax>,
+        result: Option<Box<TypeSyntax>>,
+        calling_convention: CallingConventionSyntax,
     },
     ClassForward,
     Array {
+        indices: Vec<TypeSyntax>,
         element: Option<Box<TypeSyntax>>,
         dynamic: bool,
     },
@@ -92,6 +124,7 @@ pub struct TypeDeclarationSyntax {
 pub struct ValueDeclarationSyntax {
     pub names: Vec<SpannedName>,
     pub ty: Option<TypeSyntax>,
+    pub initializer: Option<Expr>,
     pub span: Span,
     pub modes: ModeSnapshot,
 }

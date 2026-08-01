@@ -1,6 +1,6 @@
 use crate::{ForDirection, Literal, ModeSnapshot, Operator, Span};
 
-use super::{EnvironmentId, ExplicitConversion, ReceiverId, SymbolId, TypeRef, ValueConversion};
+use super::{ApplicationResolution, EnvironmentId, ReceiverId, SymbolId, TypeRef};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundBody {
@@ -134,6 +134,7 @@ pub enum BoundExpressionKind {
     Literal(Literal),
     Application {
         target: BoundApplicationTarget,
+        callee: Option<Box<BoundExpression>>,
         operands: Vec<BoundExpression>,
     },
     Member {
@@ -152,24 +153,18 @@ pub enum BoundExpressionKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoundApplicationTarget {
     Routine {
-        candidates: Vec<SymbolId>,
-        selected: Option<SymbolId>,
-        receiver: Option<ReceiverId>,
+        resolution: ApplicationResolution,
     },
     CallableValue {
-        symbol: Option<SymbolId>,
-        callable_type: TypeRef,
-        receiver: Option<ReceiverId>,
+        resolution: ApplicationResolution,
     },
     Conversion {
         destination: TypeRef,
-        conversion: Option<ExplicitConversion>,
+        resolution: ApplicationResolution,
     },
     Operator {
         operator: Operator,
-        candidates: Vec<SymbolId>,
-        selected: Option<SymbolId>,
-        operand_conversions: Vec<Option<ValueConversion>>,
+        resolution: ApplicationResolution,
     },
     Invalid,
 }

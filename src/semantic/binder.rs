@@ -597,7 +597,7 @@ impl SemanticBinder {
         match self.scopes.region_owner(region) {
             RegionOwner::Routine(parent) => TypeOwner::Routine(parent),
             RegionOwner::Type(parent) => TypeOwner::Type(parent),
-            RegionOwner::Root | RegionOwner::Unit(_) | RegionOwner::Block(_) => {
+            RegionOwner::Root | RegionOwner::Module(_) | RegionOwner::Block(_) => {
                 self.fresh_declaration_owner()
             }
         }
@@ -712,7 +712,7 @@ mod tests {
             .declare_routine(
                 parent_name,
                 empty_signature(),
-                RoutineOwner::Unit,
+                RoutineOwner::Module,
                 DeclarationMode::Fresh,
             )
             .unwrap();

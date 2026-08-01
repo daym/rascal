@@ -4,7 +4,7 @@ use crate::{
     CstNode, Diagnostic, PascalFile, PascalSectionKind, Span, Token, TokenKind,
     declaration_ast::{
         AggregateSyntaxKind, CallingConventionSyntax, DeclarationParseOutput, DeclarationSyntax,
-        FormalModeSyntax, FormalParameterSyntax, ParsedDeclarationSection,
+        EnumMemberSyntax, FormalModeSyntax, FormalParameterSyntax, ParsedDeclarationSection,
         RoutineDeclarationSyntax, RoutineSyntaxKind, SpannedName, TypeDeclarationSyntax,
         TypeSyntax, TypeSyntaxKind, ValueDeclarationSyntax,
     },
@@ -248,6 +248,33 @@ fn parenthesized_base(tokens: &[Token], start: usize) -> Option<TypeSyntax> {
     named_type(&tokens[start + 1..end])
 }
 
+fn split_top_level(tokens: &[Token], delimiter: TokenKind) -> Vec<&[Token]> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        match token.kind {
+            TokenKind::LeftParen => paren_depth += 1,
+            TokenKind::RightParen => paren_depth = paren_depth.saturating_sub(1),
+            TokenKind::LeftBracket => bracket_depth += 1,
+            TokenKind::RightBracket => bracket_depth = bracket_depth.saturating_sub(1),
+            _ if token.kind == delimiter && paren_depth == 0 && bracket_depth == 0 => {
+                parts.push(&tokens[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&tokens[start..]);
+    parts
+}
+
+fn expression_syntax(tokens: &[Token]) -> Option<crate::Expr> {
+    let fallback = tokens.last().map_or(0, |token| token.span.end);
+    crate::chumsky_parser::parse_expression_tokens(tokens, fallback).0
+}
+
 fn aggregate_end(tokens: &[Token], opening: usize) -> Option<usize> {
     let mut depth = 0usize;
     for index in opening..tokens.len() {
@@ -293,15 +320,76 @@ fn parse_type_syntax(tokens: &[Token]) -> TypeSyntax {
             modes,
         };
     }
+    if tokens.first().is_some_and(|token| token.kind == TokenKind::LeftParen)
+        && tokens.last().is_some_and(|token| token.kind == TokenKind::RightParen)
+    {
+        let mut members = Vec::new();
+        for part in split_top_level(&tokens[1..tokens.len() - 1], TokenKind::Comma) {
+            let Some(name_token) = part.first() else {
+                continue;
+            };
+            let TokenKind::Identifier(spelling) = &name_token.kind else {
+                return TypeSyntax {
+                    kind: TypeSyntaxKind::Unsupported(tokens.to_vec()),
+                    span,
+                    modes,
+                };
+            };
+            let equal = part.iter().position(|token| token.kind == TokenKind::Equal);
+            let value = equal.and_then(|equal| expression_syntax(&part[equal + 1..]));
+            members.push(EnumMemberSyntax {
+                name: SpannedName {
+                    spelling: spelling.clone(),
+                    span: name_token.span.clone(),
+                },
+                value,
+                span: token_span(part, name_token.span.start),
+            });
+        }
+        return TypeSyntax {
+            kind: TypeSyntaxKind::Enumeration(members),
+            span,
+            modes,
+        };
+    }
+    if let Some(range) = tokens
+        .iter()
+        .position(|token| token.kind == TokenKind::DotDot)
+        && let (Some(lower), Some(upper)) = (
+            expression_syntax(&tokens[..range]),
+            expression_syntax(&tokens[range + 1..]),
+        )
+    {
+        return TypeSyntax {
+            kind: TypeSyntaxKind::Subrange { lower, upper },
+            span,
+            modes,
+        };
+    }
     if tokens
         .first()
         .is_some_and(|token| is_keyword(token, "procedure") || is_keyword(token, "function"))
     {
+        let (parameters, result) = routine_signature_syntax(tokens);
         let method_pointer = tokens
             .windows(2)
             .any(|window| is_keyword(&window[0], "of") && is_keyword(&window[1], "object"));
+        let calling_convention = if tokens.iter().any(|token| is_keyword(token, "cdecl")) {
+            CallingConventionSyntax::Cdecl
+        } else if tokens.iter().any(|token| is_keyword(token, "stdcall")) {
+            CallingConventionSyntax::Stdcall
+        } else if tokens.iter().any(|token| is_keyword(token, "register")) {
+            CallingConventionSyntax::Register
+        } else {
+            CallingConventionSyntax::Pascal
+        };
         return TypeSyntax {
-            kind: TypeSyntaxKind::Procedural { method_pointer },
+            kind: TypeSyntaxKind::Procedural {
+                method_pointer,
+                parameters,
+                result: result.map(Box::new),
+                calling_convention,
+            },
             span,
             modes,
         };
@@ -311,6 +399,22 @@ fn parse_type_syntax(tokens: &[Token]) -> TypeSyntax {
         .is_some_and(|token| is_keyword(token, "array"))
     {
         let of = tokens.iter().position(|token| is_keyword(token, "of"));
+        let indices = tokens
+            .iter()
+            .position(|token| token.kind == TokenKind::LeftBracket)
+            .and_then(|open| {
+                tokens[open + 1..]
+                    .iter()
+                    .position(|token| token.kind == TokenKind::RightBracket)
+                    .map(|offset| (open, open + 1 + offset))
+            })
+            .map_or_else(Vec::new, |(open, close)| {
+                split_top_level(&tokens[open + 1..close], TokenKind::Comma)
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .map(parse_type_syntax)
+                    .collect()
+            });
         let element = of
             .filter(|index| index + 1 < tokens.len())
             .map(|index| Box::new(parse_type_syntax(&tokens[index + 1..])));
@@ -318,7 +422,11 @@ fn parse_type_syntax(tokens: &[Token]) -> TypeSyntax {
             .iter()
             .any(|token| token.kind == TokenKind::LeftBracket);
         return TypeSyntax {
-            kind: TypeSyntaxKind::Array { element, dynamic },
+            kind: TypeSyntaxKind::Array {
+                indices,
+                element,
+                dynamic,
+            },
             span,
             modes,
         };
@@ -386,6 +494,7 @@ fn parse_type_syntax(tokens: &[Token]) -> TypeSyntax {
                 kind,
                 base,
                 members,
+                variant: None,
             },
             span,
             modes,
@@ -451,15 +560,41 @@ fn parse_value_declaration(tokens: &[Token], constant: bool) -> Option<ValueDecl
             token.kind == TokenKind::Equal
                 || token.kind == TokenKind::Assign
                 || is_keyword(token, "absolute")
+                || is_keyword(token, "read")
+                || is_keyword(token, "write")
+                || is_keyword(token, "stored")
+                || is_keyword(token, "default")
+                || is_keyword(token, "nodefault")
+                || is_keyword(token, "implements")
         })
         .map_or(tokens.len().saturating_sub(1), |offset| {
             separator + 1 + offset
         });
     let ty = (tokens[separator].kind == TokenKind::Colon && separator + 1 < type_end)
         .then(|| parse_type_syntax(&tokens[separator + 1..type_end]));
+    let initializer_start = if tokens[separator].kind == TokenKind::Equal {
+        Some(separator + 1)
+    } else {
+        tokens[separator + 1..]
+            .iter()
+            .position(|token| {
+                token.kind == TokenKind::Equal || token.kind == TokenKind::Assign
+            })
+            .map(|offset| separator + offset + 2)
+    };
+    let initializer = initializer_start.and_then(|start| {
+        let end = tokens
+            .iter()
+            .rposition(|token| token.kind != TokenKind::Semicolon)
+            .map_or(start, |last| last + 1);
+        (start < end)
+            .then(|| expression_syntax(&tokens[start..end]))
+            .flatten()
+    });
     Some(ValueDeclarationSyntax {
         names: names?,
         ty,
+        initializer,
         span: token_span(tokens, 0),
         modes: tokens
             .first()
@@ -479,7 +614,29 @@ fn routine_kind(token: &Token) -> Option<RoutineSyntaxKind> {
     .find_map(|(word, kind)| is_keyword(token, word).then_some(kind))
 }
 
-fn routine_name(tokens: &[Token]) -> Option<SpannedName> {
+fn routine_name(tokens: &[Token], kind: RoutineSyntaxKind) -> Option<SpannedName> {
+    if kind == RoutineSyntaxKind::Operator {
+        let token = tokens.get(1)?;
+        let spelling = match &token.kind {
+            TokenKind::Identifier(spelling) => spelling.clone(),
+            TokenKind::Assign => ":=".to_owned(),
+            TokenKind::Plus => "+".to_owned(),
+            TokenKind::Minus => "-".to_owned(),
+            TokenKind::Star => "*".to_owned(),
+            TokenKind::Slash => "/".to_owned(),
+            TokenKind::Equal => "=".to_owned(),
+            TokenKind::NotEqual => "<>".to_owned(),
+            TokenKind::Less => "<".to_owned(),
+            TokenKind::Greater => ">".to_owned(),
+            TokenKind::LessEqual => "<=".to_owned(),
+            TokenKind::GreaterEqual => ">=".to_owned(),
+            _ => return None,
+        };
+        return Some(SpannedName {
+            spelling,
+            span: token.span.clone(),
+        });
+    }
     let header_end = first_semicolon(tokens, 0).min(tokens.len());
     let end = tokens[1..header_end]
         .iter()
@@ -881,7 +1038,10 @@ impl<'a> DeclarationScanner<'a> {
             }
         }
         let end = cursor.max(header_end + 1).min(self.tokens.len());
-        let name = routine_name(&self.tokens[start..=header_end.min(self.tokens.len() - 1)])
+        let name = routine_name(
+            &self.tokens[start..=header_end.min(self.tokens.len() - 1)],
+            kind,
+        )
             .unwrap_or_else(|| SpannedName {
                 spelling: "<missing>".to_owned(),
                 span: self.tokens[start].span.clone(),
@@ -913,6 +1073,7 @@ impl<'a> DeclarationScanner<'a> {
             .unwrap_or_else(|| ValueDeclarationSyntax {
                 names: Vec::new(),
                 ty: None,
+                initializer: None,
                 span: token_span(
                     &self.tokens[start..end_exclusive],
                     self.tokens[start].span.start,

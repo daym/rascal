@@ -712,8 +712,7 @@ mod tests {
         let mut graph = ScopeGraph::new();
         let name = graph.intern_name("X");
 
-        let (_, mut a) =
-            graph.create_detached_region(RegionOwner::Module(ModuleId(0)), Vec::new());
+        let (_, mut a) = graph.create_detached_region(RegionOwner::Module(ModuleId(0)), Vec::new());
         graph.current = a;
         let a_type = graph
             .declare(
@@ -725,8 +724,7 @@ mod tests {
             .unwrap();
         a = graph.current_environment();
 
-        let (_, mut b) =
-            graph.create_detached_region(RegionOwner::Module(ModuleId(1)), Vec::new());
+        let (_, mut b) = graph.create_detached_region(RegionOwner::Module(ModuleId(1)), Vec::new());
         graph.current = b;
         let b_value = graph
             .declare(

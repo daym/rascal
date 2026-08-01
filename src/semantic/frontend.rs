@@ -1,28 +1,30 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     Application, Callee, CaseLabel, Diagnostic, Expr, ExprKind, Literal, Operator, PascalFile,
     PascalFileKind, PascalSectionKind, Span, Statement, Token, TryContinuation, chumsky_parser,
     declaration_ast::{
         AggregateSyntaxKind, CallingConventionSyntax, DeclarationSyntax, FormalModeSyntax,
-        RoutineDeclarationSyntax, RoutineSyntaxKind, SpannedName, TypeDeclarationSyntax,
-        TypeSyntax, TypeSyntaxKind, ValueDeclarationSyntax,
+        FormalParameterSyntax, RoutineDeclarationSyntax, RoutineSyntaxKind, SpannedName,
+        TypeDeclarationSyntax, TypeSyntax, TypeSyntaxKind, ValueDeclarationSyntax,
     },
     declaration_parser::{parse_file_declarations, section_tokens},
     pascal_parser,
 };
 
 use super::{
-    AggregateDefinition, AggregateKind, AliasType, ArrayType, BindError, BoundApplicationTarget,
-    BoundBody, BoundCaseArm, BoundCaseLabel, BoundExceptionHandler, BoundExpression,
-    BoundExpressionKind, BoundStatement, BoundStatementKind, BoundTryContinuation, CallableFlavor,
-    CallableType, CallingConvention, Capture, ConversionRank, DeclarationMode, DeclarationState,
-    DeclaredRoutine, EnvironmentId, EnvironmentRequirement, FieldLayout, FormalParameter,
-    FrameKind, IncompleteReason, LookupBarrier, LookupEdge, LookupRequest, LookupResult, NameId,
-    NodeId, OpaqueType, ParameterMode, PointerType, PrimitiveKind, PrimitiveType, ReceiverId,
-    RegionOwner, RoutineOwner, RoutineSignature, ScopeGraph, SemanticBinder, StorageLayout,
-    SymbolCategory, SymbolFilter, SymbolId, SymbolKind, TypeOwner, TypeRef, UnitGraphError, UnitId,
-    UnitPhase, UnitRegistry, ValueConversion,
+    ActualArgument, AggregateDefinition, AggregateKind, AliasType, ApplicationCandidate,
+    ApplicationReceiver, ApplicationResolution, ApplicationResolver, ApplicationSelection,
+    ArrayType, BindError, BoundApplicationTarget, BoundBody, BoundCaseArm, BoundCaseLabel,
+    BoundExceptionHandler, BoundExpression, BoundExpressionKind, BoundStatement,
+    BoundStatementKind, BoundTryContinuation, CallableFlavor, CallableType, CallingConvention,
+    Capture, DeclarationMode, DeclarationState, DeclaredRoutine, EnvironmentId,
+    EnvironmentRequirement, FieldLayout, FormalParameter, FrameKind, IncompleteReason,
+    LookupBarrier, LookupEdge, LookupRequest, LookupResult, ModuleGraphError, ModuleId,
+    ModulePhase, ModuleRegistry, NameId, NodeId, OpaqueType, ParameterMode, PointerType,
+    PrimitiveKind, PrimitiveType, ReceiverId, RegionOwner, RoutineOwner, RoutineSignature,
+    SemanticBinder, StorageLayout, SymbolCategory, SymbolFilter, SymbolId, SymbolKind, TypeOwner,
+    TypeRef,
 };
 
 #[derive(Clone, Debug)]
@@ -38,7 +40,7 @@ pub struct BoundFile {
 #[derive(Debug)]
 pub struct SemanticCompilation {
     pub binder: SemanticBinder,
-    pub units: UnitRegistry,
+    pub modules: ModuleRegistry,
     pub files: Vec<BoundFile>,
     pub bodies: Vec<BoundBody>,
     pub diagnostics: Vec<Diagnostic>,
@@ -57,7 +59,7 @@ struct ParsedInput {
     file: PascalFile,
     declarations: crate::declaration_ast::DeclarationParseOutput,
     body_tokens: Vec<Token>,
-    unit: Option<UnitId>,
+    module: Option<ModuleId>,
 }
 
 #[derive(Clone, Copy)]
@@ -66,21 +68,14 @@ struct ResolvedParameter {
     ty: TypeRef,
 }
 
-struct RankedCandidate {
-    score: u32,
-    symbol: SymbolId,
-    conversions: Vec<Option<ValueConversion>>,
-    result: Option<TypeRef>,
-}
-
 struct CompilationDriver {
     binder: SemanticBinder,
-    units: UnitRegistry,
-    unit_names: BTreeMap<String, UnitId>,
+    modules: ModuleRegistry,
+    module_names: BTreeMap<String, ModuleId>,
     diagnostics: Vec<Diagnostic>,
     bodies: Vec<BoundBody>,
     builtins: BuiltinTypes,
-    system_unit: UnitId,
+    system_module: ModuleId,
     system_exports: EnvironmentId,
     routine_forwards: BTreeMap<(super::RegionId, NameId), DeclaredRoutine>,
     next_anonymous_type: usize,
@@ -99,18 +94,18 @@ impl CompilationDriver {
             .environment_region(binder.scopes.current_environment());
         let system_exports = binder.scopes.create_region_view(root_region, Vec::new());
         let system_name = binder.scopes.intern_name("System");
-        let mut units = UnitRegistry::new();
-        let system_unit = units.add_unit(system_name, system_exports);
-        let mut unit_names = BTreeMap::new();
-        unit_names.insert("system".to_owned(), system_unit);
+        let mut modules = ModuleRegistry::new();
+        let system_module = modules.add_module(system_name, system_exports);
+        let mut module_names = BTreeMap::new();
+        module_names.insert("system".to_owned(), system_module);
         Self {
             binder,
-            units,
-            unit_names,
+            modules,
+            module_names,
             diagnostics: Vec::new(),
             bodies: Vec::new(),
             builtins,
-            system_unit,
+            system_module,
             system_exports,
             routine_forwards: BTreeMap::new(),
             next_anonymous_type: 0,
@@ -120,7 +115,7 @@ impl CompilationDriver {
         }
     }
 
-    fn register_units(&mut self, inputs: &mut [ParsedInput]) {
+    fn register_modules(&mut self, inputs: &mut [ParsedInput]) {
         for input in inputs {
             if input.file.kind != PascalFileKind::Unit {
                 continue;
@@ -128,55 +123,55 @@ impl CompilationDriver {
             let Some(name) = input.file.name.as_deref() else {
                 continue;
             };
-            if self.unit_names.contains_key(name) {
+            if self.module_names.contains_key(name) {
                 self.diagnostics.push(Diagnostic::new(
                     input.file.span.clone(),
                     format!("duplicate unit `{name}`"),
                 ));
                 continue;
             }
-            let predicted = UnitId::from_index(self.units_len());
+            let predicted = ModuleId::from_index(self.modules_len());
             let (_, exports) = self
                 .binder
                 .scopes
-                .create_detached_region(RegionOwner::Unit(predicted), Vec::new());
+                .create_detached_region(RegionOwner::Module(predicted), Vec::new());
             let name_id = self.binder.scopes.intern_name(name);
-            let unit = self.units.add_unit(name_id, exports);
-            debug_assert_eq!(unit, predicted);
-            self.unit_names.insert(name.to_owned(), unit);
-            input.unit = Some(unit);
+            let module = self.modules.add_module(name_id, exports);
+            debug_assert_eq!(module, predicted);
+            self.module_names.insert(name.to_owned(), module);
+            input.module = Some(module);
         }
     }
 
-    fn units_len(&self) -> usize {
-        self.unit_names.len()
+    fn modules_len(&self) -> usize {
+        self.module_names.len()
     }
 
     fn configure_uses(&mut self, inputs: &[ParsedInput]) {
         for input in inputs {
-            let Some(unit) = input.unit else {
+            let Some(module) = input.module else {
                 continue;
             };
             for section in &input.declarations.sections {
                 let phase = match section.kind {
-                    PascalSectionKind::Interface => UnitPhase::Interface,
-                    PascalSectionKind::Implementation => UnitPhase::Implementation,
+                    PascalSectionKind::Interface => ModulePhase::Interface,
+                    PascalSectionKind::Implementation => ModulePhase::Implementation,
                     _ => continue,
                 };
                 let uses = self.resolve_uses(&section.declarations);
-                self.units.set_uses(unit, phase, uses);
+                self.modules.set_uses(module, phase, uses);
             }
         }
     }
 
-    fn resolve_uses(&mut self, declarations: &[DeclarationSyntax]) -> Vec<UnitId> {
+    fn resolve_uses(&mut self, declarations: &[DeclarationSyntax]) -> Vec<ModuleId> {
         let mut result = Vec::new();
         for declaration in declarations {
             let DeclarationSyntax::Uses { units, .. } = declaration else {
                 continue;
             };
             for unit in units {
-                if let Some(resolved) = self.unit_names.get(&unit.spelling) {
+                if let Some(resolved) = self.module_names.get(&unit.spelling) {
                     result.push(*resolved);
                 } else {
                     self.diagnostics.push(Diagnostic::new(
@@ -189,10 +184,10 @@ impl CompilationDriver {
         result
     }
 
-    fn bind_unit_interfaces(&mut self, inputs: &[ParsedInput]) {
-        let order = match self.units.interface_order() {
+    fn bind_module_interfaces(&mut self, inputs: &[ParsedInput]) {
+        let order = match self.modules.interface_order() {
             Ok(order) => order,
-            Err(UnitGraphError::InterfaceCycle { cycle }) => {
+            Err(ModuleGraphError::InterfaceCycle { cycle }) => {
                 self.diagnostics.push(Diagnostic::new(
                     0..0,
                     format!("interface uses cycle: {cycle:?}"),
@@ -200,19 +195,19 @@ impl CompilationDriver {
                 return;
             }
         };
-        for unit in order {
-            if unit == self.system_unit {
+        for module in order {
+            if module == self.system_module {
                 continue;
             }
-            let Some(input) = inputs.iter().find(|input| input.unit == Some(unit)) else {
+            let Some(input) = inputs.iter().find(|input| input.module == Some(module)) else {
                 continue;
             };
-            let local = self.units.unit(unit).interface_exports;
-            let lookup = self.units.interface_lookup_environment(
+            let local = self.modules.module(module).interface_exports;
+            let lookup = self.modules.interface_lookup_environment(
                 &mut self.binder.scopes,
-                unit,
+                module,
                 local,
-                Some((self.system_unit, self.system_exports)),
+                Some((self.system_module, self.system_exports)),
             );
             self.binder.scopes.select_environment(lookup);
             if let Some(section) = input
@@ -221,29 +216,29 @@ impl CompilationDriver {
                 .iter()
                 .find(|section| section.kind == PascalSectionKind::Interface)
             {
-                self.bind_declarations(&section.declarations, RoutineOwner::Unit, None);
+                self.bind_declarations(&section.declarations, RoutineOwner::Module, None);
             }
             let region = self
                 .binder
                 .scopes
                 .environment_region(self.binder.scopes.current_environment());
             let exports = self.binder.scopes.create_region_view(region, Vec::new());
-            self.units.set_interface_exports(unit, exports);
+            self.modules.set_interface_exports(module, exports);
         }
     }
 
     fn bind_remaining_files(&mut self, inputs: &[ParsedInput], files: &mut Vec<BoundFile>) {
         for input in inputs {
-            let environment = if let Some(unit) = input.unit {
+            let environment = if let Some(module) = input.module {
                 let (_, local) = self
                     .binder
                     .scopes
-                    .create_detached_region(RegionOwner::Unit(unit), Vec::new());
-                let lookup = self.units.implementation_lookup_environment(
+                    .create_detached_region(RegionOwner::Module(module), Vec::new());
+                let lookup = self.modules.implementation_lookup_environment(
                     &mut self.binder.scopes,
-                    unit,
+                    module,
                     local,
-                    Some((self.system_unit, self.system_exports)),
+                    Some((self.system_module, self.system_exports)),
                 );
                 self.binder.scopes.select_environment(lookup);
                 if let Some(section) = input
@@ -252,7 +247,7 @@ impl CompilationDriver {
                     .iter()
                     .find(|section| section.kind == PascalSectionKind::Implementation)
                 {
-                    self.bind_declarations(&section.declarations, RoutineOwner::Unit, None);
+                    self.bind_declarations(&section.declarations, RoutineOwner::Module, None);
                 }
                 self.binder.scopes.current_environment()
             } else {
@@ -283,16 +278,14 @@ impl CompilationDriver {
         let uses =
             declarations.map_or_else(Vec::new, |section| self.resolve_uses(&section.declarations));
         let mut layers = vec![LookupEdge::lexical_parent(local)];
-        layers.extend(
-            uses.iter()
-                .rev()
-                .map(|unit| LookupEdge::import(self.units.unit(*unit).interface_exports, *unit)),
-        );
-        layers.push(LookupEdge::system(self.system_exports, self.system_unit));
+        layers.extend(uses.iter().rev().map(|module| {
+            LookupEdge::import(self.modules.module(*module).interface_exports, *module)
+        }));
+        layers.push(LookupEdge::system(self.system_exports, self.system_module));
         let lookup = self.binder.scopes.create_lookup_environment(region, layers);
         self.binder.scopes.select_environment(lookup);
         if let Some(section) = declarations {
-            self.bind_declarations(&section.declarations, RoutineOwner::Unit, None);
+            self.bind_declarations(&section.declarations, RoutineOwner::Module, None);
         }
         self.bind_body_tokens(None, &input.body_tokens);
         self.binder.scopes.current_environment()
@@ -427,16 +420,26 @@ impl CompilationDriver {
                     self.bind_error(declaration.span.clone(), error);
                 }
             }
-            TypeSyntaxKind::Procedural { method_pointer } => {
+            TypeSyntaxKind::Procedural {
+                method_pointer,
+                parameters,
+                result,
+                calling_convention,
+            } => {
                 let flavor = if *method_pointer {
                     CallableFlavor::Method
                 } else {
                     CallableFlavor::Routine
                 };
+                let signature = self.resolve_procedural_signature(
+                    parameters,
+                    result.as_deref(),
+                    *calling_convention,
+                );
                 let implementation = CallableType {
-                    owner: RoutineOwner::Unit,
+                    owner: RoutineOwner::Module,
                     flavor,
-                    signature: empty_signature(),
+                    signature,
                     declaration_region: None,
                     nested_routines: Vec::new(),
                     local_types: Vec::new(),
@@ -776,15 +779,45 @@ impl CompilationDriver {
             RoutineSignature {
                 parameters: formals,
                 result,
-                calling_convention: match routine.calling_convention {
-                    CallingConventionSyntax::Pascal => CallingConvention::Pascal,
-                    CallingConventionSyntax::Register => CallingConvention::Register,
-                    CallingConventionSyntax::Cdecl => CallingConvention::Cdecl,
-                    CallingConventionSyntax::Stdcall => CallingConvention::Stdcall,
-                },
+                calling_convention: semantic_calling_convention(routine.calling_convention),
             },
             parameters,
         )
+    }
+
+    fn resolve_procedural_signature(
+        &mut self,
+        parameters: &[FormalParameterSyntax],
+        result: Option<&TypeSyntax>,
+        calling_convention: CallingConventionSyntax,
+    ) -> RoutineSignature {
+        let mut formals = Vec::new();
+        for parameter in parameters {
+            let ty = parameter
+                .ty
+                .as_ref()
+                .and_then(|syntax| self.resolve_type(syntax))
+                .unwrap_or(self.builtins.untyped_parameter);
+            let mode = match parameter.mode {
+                FormalModeSyntax::Value => ParameterMode::Value,
+                FormalModeSyntax::Const => ParameterMode::Const,
+                FormalModeSyntax::Var => ParameterMode::Var,
+                FormalModeSyntax::Out => ParameterMode::Out,
+                FormalModeSyntax::ConstRef => ParameterMode::ConstRef,
+            };
+            for _ in &parameter.names {
+                formals.push(FormalParameter {
+                    mode,
+                    ty,
+                    has_default: parameter.has_default,
+                });
+            }
+        }
+        RoutineSignature {
+            parameters: formals,
+            result: result.and_then(|result| self.resolve_type(result)),
+            calling_convention: semantic_calling_convention(calling_convention),
+        }
     }
 
     fn bind_body_tokens(&mut self, owner: Option<TypeRef>, tokens: &[Token]) {
@@ -1579,10 +1612,8 @@ impl CompilationDriver {
                     );
                 }
                 let callee = self.bind_expression(callee, owner);
-                let Some(callable_type) = callee
-                    .ty
-                    .filter(|ty| self.binder.types.callable(*ty).is_some())
-                else {
+                let candidate = self.application_candidate_from_callee(&callee);
+                let Some(candidate) = candidate else {
                     self.diagnostics.push(Diagnostic::new(
                         application.span.clone(),
                         "application operand is not callable",
@@ -1590,29 +1621,34 @@ impl CompilationDriver {
                     return BoundExpression {
                         kind: BoundExpressionKind::Application {
                             target: BoundApplicationTarget::Invalid,
+                            callee: Some(Box::new(callee)),
                             operands,
                         },
                         ty: None,
                         span: application.span.clone(),
                     };
                 };
-                let symbol = match callee.kind {
-                    BoundExpressionKind::Symbol { symbol, .. }
-                    | BoundExpressionKind::Member { symbol, .. } => Some(symbol),
-                    _ => None,
+                let target_kind = match candidate {
+                    ApplicationCandidate::Routine { .. } => 0,
+                    ApplicationCandidate::CallableValue { .. } => 1,
+                    ApplicationCandidate::Conversion { .. } => unreachable!(),
                 };
-                let result = self
-                    .binder
-                    .types
-                    .callable(callable_type)
-                    .and_then(|callable| callable.signature.result);
+                let resolution = self.resolve_application(vec![candidate], &operands);
+                self.report_application_resolution(
+                    &resolution,
+                    application.span.clone(),
+                    "callable expression",
+                );
+                let result = resolution.result_type();
+                let target = if target_kind == 0 {
+                    BoundApplicationTarget::Routine { resolution }
+                } else {
+                    BoundApplicationTarget::CallableValue { resolution }
+                };
                 BoundExpression {
                     kind: BoundExpressionKind::Application {
-                        target: BoundApplicationTarget::CallableValue {
-                            symbol,
-                            callable_type,
-                            receiver: None,
-                        },
+                        target,
+                        callee: Some(Box::new(callee)),
                         operands,
                     },
                     ty: result,
@@ -1649,56 +1685,42 @@ impl CompilationDriver {
         let primary_kind = self.binder.scopes.symbol(primary).kind.clone();
         match primary_kind {
             SymbolKind::Type(destination) => {
-                let conversion = if operands.len() == 1 {
-                    operands[0].ty.and_then(|source| {
-                        self.binder
-                            .types
-                            .predefined_explicit_conversion(destination, source)
-                    })
-                } else {
-                    None
-                };
-                if operands.len() != 1 || conversion.is_none() {
-                    self.diagnostics.push(Diagnostic::new(
-                        span.clone(),
-                        format!("invalid direct conversion to `{spelling}`"),
-                    ));
-                }
+                let resolution = self.resolve_application(
+                    vec![ApplicationCandidate::Conversion { destination }],
+                    &operands,
+                );
+                self.report_application_resolution(
+                    &resolution,
+                    span.clone(),
+                    &format!("direct conversion to `{spelling}`"),
+                );
+                let result_type = resolution.result_type();
                 BoundExpression {
                     kind: BoundExpressionKind::Application {
                         target: BoundApplicationTarget::Conversion {
                             destination,
-                            conversion,
+                            resolution,
                         },
+                        callee: None,
                         operands,
                     },
-                    ty: Some(destination),
+                    ty: result_type,
                     span,
                 }
             }
             SymbolKind::Routine(_) => {
-                let candidates = callable_symbols(&result, &self.binder.scopes);
-                let (selected, _, result_type) = self.select_candidate(&candidates, &operands);
-                if selected.is_none() {
-                    self.diagnostics.push(Diagnostic::new(
-                        span.clone(),
-                        format!("no viable overload for `{spelling}`"),
-                    ));
-                }
+                let candidates = callable_candidates(&result, &self.binder, owner);
+                let resolution = self.resolve_application(candidates, &operands);
+                self.report_application_resolution(
+                    &resolution,
+                    span.clone(),
+                    &format!("overload for `{spelling}`"),
+                );
+                let result_type = resolution.result_type();
                 BoundExpression {
                     kind: BoundExpressionKind::Application {
-                        target: BoundApplicationTarget::Routine {
-                            candidates,
-                            selected,
-                            receiver: selected.and_then(|selected| {
-                                result
-                                    .primary
-                                    .iter()
-                                    .chain(result.shadowed.iter().flatten())
-                                    .find(|hit| hit.symbol == selected)
-                                    .and_then(|hit| hit.receiver)
-                            }),
-                        },
+                        target: BoundApplicationTarget::Routine { resolution },
+                        callee: None,
                         operands,
                     },
                     ty: result_type,
@@ -1709,18 +1731,26 @@ impl CompilationDriver {
                 if self.binder.types.callable(callable_type).is_some() =>
             {
                 self.note_capture(owner, primary);
-                let result_type = self
-                    .binder
-                    .types
-                    .callable(callable_type)
-                    .and_then(|callable| callable.signature.result);
+                let resolution = self.resolve_application(
+                    vec![ApplicationCandidate::CallableValue {
+                        symbol: Some(primary),
+                        callable_type,
+                        receiver: ApplicationReceiver::CallableValue {
+                            lookup_receiver: primary_receiver,
+                        },
+                    }],
+                    &operands,
+                );
+                self.report_application_resolution(
+                    &resolution,
+                    span.clone(),
+                    &format!("procedural value `{spelling}`"),
+                );
+                let result_type = resolution.result_type();
                 BoundExpression {
                     kind: BoundExpressionKind::Application {
-                        target: BoundApplicationTarget::CallableValue {
-                            symbol: Some(primary),
-                            callable_type,
-                            receiver: primary_receiver,
-                        },
+                        target: BoundApplicationTarget::CallableValue { resolution },
+                        callee: None,
                         operands,
                     },
                     ty: result_type,
@@ -1755,27 +1785,25 @@ impl CompilationDriver {
                 LookupRequest::ORDINARY,
             )
             .map_or_else(Vec::new, |result| {
-                callable_symbols(&result, &self.binder.scopes)
+                callable_candidates(&result, &self.binder, None)
             });
-        let (selected, conversions, mut result_type) =
-            self.select_candidate(&candidates, &operands);
+        let resolution = self.resolve_application(candidates, &operands);
+        self.report_application_resolution(
+            &resolution,
+            span.clone(),
+            &format!("`{}` operator", operator.spelling()),
+        );
+        let mut result_type = resolution.result_type();
         if operator == Operator::Assign {
             result_type = operands.first().and_then(|operand| operand.ty);
-        }
-        if selected.is_none() {
-            self.diagnostics.push(Diagnostic::new(
-                span.clone(),
-                format!("no viable `{}` operator", operator.spelling()),
-            ));
         }
         BoundExpression {
             kind: BoundExpressionKind::Application {
                 target: BoundApplicationTarget::Operator {
                     operator,
-                    candidates,
-                    selected,
-                    operand_conversions: conversions,
+                    resolution,
                 },
+                callee: None,
                 operands,
             },
             ty: result_type,
@@ -1783,83 +1811,79 @@ impl CompilationDriver {
         }
     }
 
-    fn select_candidate(
+    fn application_candidate_from_callee(
         &self,
-        candidates: &[SymbolId],
+        callee: &BoundExpression,
+    ) -> Option<ApplicationCandidate> {
+        let (symbol, lookup_receiver, explicit_receiver) = match &callee.kind {
+            BoundExpressionKind::Symbol { symbol, receiver } => (Some(*symbol), *receiver, false),
+            BoundExpressionKind::Member { symbol, .. } => (Some(*symbol), None, true),
+            _ => (None, None, false),
+        };
+        let callable_type = callee.ty?;
+        let callable = self.binder.types.callable(callable_type)?;
+        if let Some(symbol) = symbol
+            && matches!(
+                self.binder.scopes.symbol(symbol).kind,
+                SymbolKind::Routine(_)
+            )
+        {
+            let receiver = if explicit_receiver {
+                ApplicationReceiver::Explicit
+            } else {
+                declared_receiver(callable.flavor, lookup_receiver, false)
+            };
+            return Some(ApplicationCandidate::Routine {
+                symbol,
+                callable_type,
+                receiver,
+            });
+        }
+        Some(ApplicationCandidate::CallableValue {
+            symbol,
+            callable_type,
+            receiver: ApplicationReceiver::CallableValue { lookup_receiver },
+        })
+    }
+
+    fn resolve_application(
+        &self,
+        candidates: Vec<ApplicationCandidate>,
         operands: &[BoundExpression],
-    ) -> (
-        Option<SymbolId>,
-        Vec<Option<ValueConversion>>,
-        Option<TypeRef>,
+    ) -> ApplicationResolution {
+        let actuals = operands
+            .iter()
+            .map(|operand| ActualArgument {
+                ty: operand.ty,
+                addressable: is_addressable(operand),
+            })
+            .collect::<Vec<_>>();
+        ApplicationResolver::new(&self.binder.types, self.builtins.untyped_parameter)
+            .resolve(candidates, &actuals)
+    }
+
+    fn report_application_resolution(
+        &mut self,
+        resolution: &ApplicationResolution,
+        span: Span,
+        description: &str,
     ) {
-        let mut best: Option<RankedCandidate> = None;
-        for symbol in candidates {
-            let Some(callable_type) = self.binder.scopes.symbol(*symbol).kind.ty() else {
-                continue;
-            };
-            let Some(callable) = self.binder.types.callable(callable_type) else {
-                continue;
-            };
-            let required_parameters = callable
-                .signature
-                .parameters
-                .iter()
-                .rposition(|parameter| !parameter.has_default)
-                .map_or(0, |index| index + 1);
-            if operands.len() < required_parameters
-                || operands.len() > callable.signature.parameters.len()
-            {
-                continue;
+        match &resolution.selection {
+            ApplicationSelection::Selected { .. } => {}
+            ApplicationSelection::Ambiguous { attempts } => {
+                self.diagnostics.push(Diagnostic::new(
+                    span,
+                    format!(
+                        "ambiguous {description}: {} viable candidates are incomparable",
+                        attempts.len()
+                    ),
+                ));
             }
-            let conversions = callable
-                .signature
-                .parameters
-                .iter()
-                .zip(operands)
-                .map(|(formal, operand)| {
-                    let actual = operand.ty?;
-                    if formal.ty == self.builtins.untyped_parameter {
-                        return is_addressable(operand).then_some(ValueConversion {
-                            rank: ConversionRank::Compatible,
-                            operation: super::ValueConversionOperation::UntypedStorage,
-                            range_check: super::RangeCheck::None,
-                        });
-                    }
-                    match formal.mode {
-                        ParameterMode::Var | ParameterMode::Out => (is_addressable(operand)
-                            && self.binder.types.same_formal_contract(formal.ty, actual))
-                        .then(ValueConversion::identity),
-                        ParameterMode::Value | ParameterMode::Const | ParameterMode::ConstRef => {
-                            self.binder.types.value_conversion(formal.ty, actual)
-                        }
-                    }
-                })
-                .collect::<Vec<_>>();
-            if conversions.iter().any(Option::is_none) {
-                continue;
-            }
-            let score = conversions
-                .iter()
-                .flatten()
-                .map(|conversion| match conversion.rank {
-                    ConversionRank::Exact => 0,
-                    ConversionRank::Subtype => 1,
-                    ConversionRank::Widening => 2,
-                    ConversionRank::Compatible => 3,
-                })
-                .sum();
-            if best.as_ref().is_none_or(|best| score < best.score) {
-                best = Some(RankedCandidate {
-                    score,
-                    symbol: *symbol,
-                    conversions,
-                    result: callable.signature.result,
-                });
+            ApplicationSelection::NoViable => {
+                self.diagnostics
+                    .push(Diagnostic::new(span, format!("no viable {description}")));
             }
         }
-        best.map_or((None, Vec::new(), None), |best| {
-            (Some(best.symbol), best.conversions, best.result)
-        })
     }
 
     fn note_capture(&mut self, owner: Option<TypeRef>, symbol: SymbolId) {
@@ -1914,16 +1938,26 @@ impl CompilationDriver {
                     open: false,
                 }))
             }
-            TypeSyntaxKind::Procedural { method_pointer } => {
+            TypeSyntaxKind::Procedural {
+                method_pointer,
+                parameters,
+                result,
+                calling_convention,
+            } => {
                 let flavor = if *method_pointer {
                     CallableFlavor::Method
                 } else {
                     CallableFlavor::Routine
                 };
+                let signature = self.resolve_procedural_signature(
+                    parameters,
+                    result.as_deref(),
+                    *calling_convention,
+                );
                 Some(self.allocate_anonymous(CallableType {
-                    owner: RoutineOwner::Unit,
+                    owner: RoutineOwner::Module,
                     flavor,
-                    signature: empty_signature(),
+                    signature,
                     declaration_region: None,
                     nested_routines: Vec::new(),
                     local_types: Vec::new(),
@@ -2030,14 +2064,47 @@ impl CompilationDriver {
     }
 }
 
-fn callable_symbols(result: &LookupResult, scopes: &ScopeGraph) -> Vec<SymbolId> {
+fn callable_candidates(
+    result: &LookupResult,
+    binder: &SemanticBinder,
+    current_callable: Option<TypeRef>,
+) -> Vec<ApplicationCandidate> {
+    let mut seen = BTreeSet::new();
     result
         .primary
         .iter()
         .chain(result.shadowed.iter().flatten())
-        .map(|hit| hit.symbol)
-        .filter(|symbol| matches!(scopes.symbol(*symbol).kind, SymbolKind::Routine(_)))
+        .filter_map(|hit| {
+            if !seen.insert(hit.symbol) {
+                return None;
+            }
+            let SymbolKind::Routine(callable_type) = binder.scopes.symbol(hit.symbol).kind else {
+                return None;
+            };
+            let flavor = binder.types.callable(callable_type)?.flavor;
+            let implicit_self = current_callable
+                .and_then(|current| binder.types.callable(current))
+                .is_some_and(|current| matches!(current.owner, RoutineOwner::Type(_)));
+            Some(ApplicationCandidate::Routine {
+                symbol: hit.symbol,
+                callable_type,
+                receiver: declared_receiver(flavor, hit.receiver, implicit_self),
+            })
+        })
         .collect()
+}
+
+fn declared_receiver(
+    flavor: CallableFlavor,
+    lookup_receiver: Option<ReceiverId>,
+    implicit_self: bool,
+) -> ApplicationReceiver {
+    match (flavor, lookup_receiver) {
+        (_, Some(receiver)) => ApplicationReceiver::Lookup(receiver),
+        (CallableFlavor::Nested, None) => ApplicationReceiver::StaticLink,
+        (CallableFlavor::Method, None) if implicit_self => ApplicationReceiver::ImplicitSelf,
+        (CallableFlavor::Routine | CallableFlavor::Method, None) => ApplicationReceiver::None,
+    }
 }
 
 fn routine_declaration_mode(routine: &RoutineDeclarationSyntax) -> DeclarationMode {
@@ -2045,6 +2112,15 @@ fn routine_declaration_mode(routine: &RoutineDeclarationSyntax) -> DeclarationMo
         DeclarationMode::Overload
     } else {
         DeclarationMode::Fresh
+    }
+}
+
+fn semantic_calling_convention(syntax: CallingConventionSyntax) -> CallingConvention {
+    match syntax {
+        CallingConventionSyntax::Pascal => CallingConvention::Pascal,
+        CallingConventionSyntax::Register => CallingConvention::Register,
+        CallingConventionSyntax::Cdecl => CallingConvention::Cdecl,
+        CallingConventionSyntax::Stdcall => CallingConvention::Stdcall,
     }
 }
 
@@ -2060,6 +2136,7 @@ fn bound_application_error(span: Span, operands: Vec<BoundExpression>) -> BoundE
     BoundExpression {
         kind: BoundExpressionKind::Application {
             target: BoundApplicationTarget::Invalid,
+            callee: None,
             operands,
         },
         ty: None,
@@ -2110,14 +2187,6 @@ fn opaque_type() -> OpaqueType {
     }
 }
 
-fn empty_signature() -> RoutineSignature {
-    RoutineSignature {
-        parameters: Vec::new(),
-        result: None,
-        calling_convention: CallingConvention::Pascal,
-    }
-}
-
 fn install_system_callables(binder: &mut SemanticBinder, builtins: BuiltinTypes) {
     fn callable(
         binder: &mut SemanticBinder,
@@ -2131,7 +2200,7 @@ fn install_system_callables(binder: &mut SemanticBinder, builtins: BuiltinTypes)
             Some(name),
             binder.scopes.current_environment(),
             CallableType {
-                owner: RoutineOwner::Unit,
+                owner: RoutineOwner::Module,
                 flavor: CallableFlavor::Routine,
                 signature: RoutineSignature {
                     parameters: parameters
@@ -2345,17 +2414,17 @@ pub fn bind_sources(sources: &[(&str, &str)]) -> SemanticCompilation {
                 .unwrap_or_default(),
             file,
             declarations,
-            unit: None,
+            module: None,
         });
     }
-    driver.register_units(&mut inputs);
+    driver.register_modules(&mut inputs);
     driver.configure_uses(&inputs);
-    driver.bind_unit_interfaces(&inputs);
+    driver.bind_module_interfaces(&inputs);
     let mut files = Vec::new();
     driver.bind_remaining_files(&inputs, &mut files);
     SemanticCompilation {
         binder: driver.binder,
-        units: driver.units,
+        modules: driver.modules,
         files,
         bodies: driver.bodies,
         diagnostics: driver.diagnostics,

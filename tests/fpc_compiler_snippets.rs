@@ -85,4 +85,67 @@ fn constexp_slice_binds_variant_record_procvar_and_custom_operator() {
         resolution.selection,
         ApplicationSelection::Selected { .. }
     ));
+    let selected = resolution.selected_symbol().unwrap();
+    let declared_name = compilation.binder.scopes.symbol(selected).name;
+    let unchecked_addition = compilation
+        .binder
+        .scopes
+        .names()
+        .lookup("&op_Addition")
+        .unwrap();
+    assert_eq!(declared_name, unchecked_addition);
+    assert!(compilation.binder.scopes.names().lookup("+").is_none());
+}
+
+#[test]
+fn operator_declaration_and_invocation_share_the_catalog_identifier_in_ordinary_lookup() {
+    let source = "
+        program CanonicalOperatorIdentity;
+        type
+          TNumber = record
+            Value: LongInt;
+          end;
+
+        {$Q+}
+        operator Add(const Left, Right: TNumber): TNumber; forward;
+
+        var Left, Right: TNumber;
+        begin
+          Left + Right;
+        end.
+    ";
+    let compilation = bind_sources(&[("canonical_operator_identity.pp", source)]);
+    assert!(
+        compilation.diagnostics.is_empty(),
+        "{:#?}",
+        compilation.diagnostics
+    );
+
+    let body = compilation
+        .bodies
+        .iter()
+        .find(|body| body.owner.is_none())
+        .unwrap();
+    let BoundStatementKind::Expression(expression) = &body.statements[0].kind else {
+        panic!("expected operator expression")
+    };
+    let BoundExpressionKind::Application {
+        target: BoundApplicationTarget::Operator { resolution, .. },
+        ..
+    } = &expression.kind
+    else {
+        panic!("expected operator resolution")
+    };
+    let selected = resolution.selected_symbol().unwrap();
+    let declared_name = compilation.binder.scopes.symbol(selected).name;
+    let catalog_name = compilation
+        .binder
+        .scopes
+        .names()
+        .lookup("&op_CheckedAddition")
+        .unwrap();
+
+    assert_eq!(declared_name, catalog_name);
+    assert!(compilation.binder.scopes.names().lookup("add").is_none());
+    assert!(compilation.binder.scopes.names().lookup("+").is_none());
 }

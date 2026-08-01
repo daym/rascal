@@ -1,14 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    Application, Callee, CaseLabel, Diagnostic, Expr, ExprKind, Literal, Operator, PascalFile,
-    PascalFileKind, PascalSectionKind, Span, Statement, Token, TryContinuation, chumsky_parser,
+    Application, Callee, CaseLabel, Diagnostic, Expr, ExprKind, Literal, Operator,
+    OperatorInvocation, PascalFile, PascalFileKind, PascalSectionKind, Span, Statement, Token,
+    TryContinuation, chumsky_parser,
     declaration_ast::{
         AggregateSyntaxKind, CallingConventionSyntax, DeclarationSyntax, EnumMemberSyntax,
         FormalModeSyntax, FormalParameterSyntax, RoutineDeclarationSyntax, RoutineSyntaxKind,
         SpannedName, TypeDeclarationSyntax, TypeSyntax, TypeSyntaxKind, ValueDeclarationSyntax,
     },
     declaration_parser::{parse_file_declarations, section_tokens},
+    operator_declaration_spec, operator_declaration_specs, operator_invocation_identifier,
     pascal_parser,
 };
 
@@ -1110,8 +1112,10 @@ impl CompilationDriver {
         routine: &RoutineDeclarationSyntax,
         aggregate: &mut AggregateDefinition,
     ) {
-        let name = self.binder.scopes.intern_name(&routine.name.spelling);
         let (signature, parameters) = self.resolve_routine_signature(routine);
+        let Some(name) = self.routine_name_id(routine, &signature) else {
+            return;
+        };
         let result = signature.result;
         let method = match self.binder.declare_method(
             aggregate,
@@ -1131,8 +1135,10 @@ impl CompilationDriver {
     }
 
     fn bind_routine(&mut self, routine: &RoutineDeclarationSyntax, owner: RoutineOwner) {
-        let name = self.binder.scopes.intern_name(&routine.name.spelling);
         let (signature, parameters) = self.resolve_routine_signature(routine);
+        let Some(name) = self.routine_name_id(routine, &signature) else {
+            return;
+        };
         let result = signature.result;
         let region = self
             .binder
@@ -1192,7 +1198,12 @@ impl CompilationDriver {
             }
         }
         if let Some(result) = result {
-            for spelling in ["result", routine.name.spelling.as_str()] {
+            let result_names = if routine.kind == RoutineSyntaxKind::Operator {
+                vec!["result"]
+            } else {
+                vec!["result", routine.name.spelling.as_str()]
+            };
+            for spelling in result_names {
                 let name = self.binder.scopes.intern_name(spelling);
                 if let Err(error) = self.binder.scopes.declare(
                     name,
@@ -1224,6 +1235,45 @@ impl CompilationDriver {
         );
         self.bind_body_tokens(Some(declared.ty), &routine.body_tokens);
         self.binder.end_routine_body(checkpoint);
+    }
+
+    fn routine_name_id(
+        &mut self,
+        routine: &RoutineDeclarationSyntax,
+        signature: &RoutineSignature,
+    ) -> Option<NameId> {
+        if routine.kind != RoutineSyntaxKind::Operator {
+            return Some(self.binder.scopes.intern_name(&routine.name.spelling));
+        }
+        let arity = signature.parameters.len();
+        let logical_operands = !signature.parameters.is_empty()
+            && signature.parameters.iter().all(|parameter| {
+                self.binder.types.canonical_type(parameter.ty)
+                    == self.binder.types.canonical_type(self.builtins.boolean)
+            });
+        let implicit_conversion = operator_declaration_specs(&routine.name.spelling, arity)
+            .any(|spec| spec.invocation == OperatorInvocation::ImplicitConversion);
+        let checks_enabled = if implicit_conversion {
+            routine.modes.range_checks
+        } else {
+            routine.modes.overflow_checks
+        };
+        let Some(spec) = operator_declaration_spec(
+            &routine.name.spelling,
+            arity,
+            checks_enabled,
+            logical_operands,
+        ) else {
+            self.diagnostics.push(Diagnostic::new(
+                routine.name.span.clone(),
+                format!(
+                    "unknown or incompatible operator declaration `{}` with {arity} parameter(s)",
+                    routine.name.spelling
+                ),
+            ));
+            return None;
+        };
+        Some(self.binder.scopes.intern_name(spec.pascal_identifier))
     }
 
     fn resolve_routine_signature(
@@ -2330,7 +2380,64 @@ impl CompilationDriver {
         operands: Vec<BoundExpression>,
         modes: crate::ModeSnapshot,
     ) -> BoundExpression {
-        let name = self.binder.scopes.intern_name(operator.spelling());
+        let name = if operator == Operator::Assign {
+            self.binder.scopes.intern_name(":builtin_assign")
+        } else {
+            let invocation = match operator {
+                Operator::Positive | Operator::Negative | Operator::Not => {
+                    Some(OperatorInvocation::UnaryToken)
+                }
+                Operator::Multiply
+                | Operator::RealDivide
+                | Operator::IntegerDivide
+                | Operator::Modulo
+                | Operator::And
+                | Operator::ShiftLeft
+                | Operator::ShiftRight
+                | Operator::Add
+                | Operator::Subtract
+                | Operator::Or
+                | Operator::Xor
+                | Operator::Equal
+                | Operator::NotEqual
+                | Operator::Less
+                | Operator::Greater
+                | Operator::LessEqual
+                | Operator::GreaterEqual
+                | Operator::In => Some(OperatorInvocation::BinaryToken),
+                Operator::Assign
+                | Operator::Address
+                | Operator::ProcedureSlotAddress
+                | Operator::Is
+                | Operator::As => None,
+            };
+            let logical_operands = !operands.is_empty()
+                && operands.iter().all(|operand| {
+                    operand.ty.is_some_and(|ty| {
+                        self.binder.types.canonical_type(ty)
+                            == self.binder.types.canonical_type(self.builtins.boolean)
+                    })
+                });
+            let Some(identifier) = invocation.and_then(|invocation| {
+                operator_invocation_identifier(
+                    invocation,
+                    operator.spelling(),
+                    operands.len(),
+                    modes.overflow_checks,
+                    logical_operands,
+                )
+            }) else {
+                self.diagnostics.push(Diagnostic::new(
+                    span.clone(),
+                    format!(
+                        "operator `{}` has no canonical invocation identity",
+                        operator.spelling()
+                    ),
+                ));
+                return bound_application_error(span, operands, modes);
+            };
+            self.binder.scopes.intern_name(identifier)
+        };
         let candidates = self
             .binder
             .scopes
@@ -2828,11 +2935,10 @@ fn opaque_type() -> OpaqueType {
 fn install_system_callables(binder: &mut SemanticBinder, builtins: BuiltinTypes) {
     fn callable(
         binder: &mut SemanticBinder,
-        spelling: &str,
+        name: NameId,
         parameters: &[TypeRef],
         result: Option<TypeRef>,
     ) {
-        let name = binder.scopes.intern_name(spelling);
         let ty = binder.types.allocate_complete(
             TypeOwner::Builtin,
             Some(name),
@@ -2874,47 +2980,120 @@ fn install_system_callables(binder: &mut SemanticBinder, builtins: BuiltinTypes)
             .set_declared_in(ty, binder.scopes.symbol(symbol).declared_in);
     }
 
-    for spelling in ["+", "-", "*", "/", "div", "mod", "shl", "shr"] {
-        callable(
-            binder,
+    fn operator_callable(
+        binder: &mut SemanticBinder,
+        invocation: OperatorInvocation,
+        spelling: &str,
+        checks_enabled: bool,
+        logical_operands: bool,
+        parameters: &[TypeRef],
+        result: Option<TypeRef>,
+    ) {
+        let identifier = operator_invocation_identifier(
+            invocation,
             spelling,
+            parameters.len(),
+            checks_enabled,
+            logical_operands,
+        )
+        .expect("System operator has a catalog identity");
+        let name = binder.scopes.intern_name(identifier);
+        callable(binder, name, parameters, result);
+    }
+
+    for spelling in ["+", "-", "*", "div"] {
+        for checks_enabled in [false, true] {
+            operator_callable(
+                binder,
+                OperatorInvocation::BinaryToken,
+                spelling,
+                checks_enabled,
+                false,
+                &[builtins.integer, builtins.integer],
+                Some(builtins.integer),
+            );
+        }
+    }
+    for spelling in ["/", "mod", "shl", "shr"] {
+        operator_callable(
+            binder,
+            OperatorInvocation::BinaryToken,
+            spelling,
+            false,
+            false,
             &[builtins.integer, builtins.integer],
             Some(builtins.integer),
         );
     }
-    for spelling in ["+", "-"] {
-        callable(
+    for checks_enabled in [false, true] {
+        operator_callable(
             binder,
-            spelling,
+            OperatorInvocation::UnaryToken,
+            "-",
+            checks_enabled,
+            false,
             &[builtins.integer],
             Some(builtins.integer),
         );
     }
+    operator_callable(
+        binder,
+        OperatorInvocation::UnaryToken,
+        "+",
+        false,
+        false,
+        &[builtins.integer],
+        Some(builtins.integer),
+    );
     for spelling in ["=", "<>", "<", ">", "<=", ">="] {
-        callable(
+        operator_callable(
             binder,
+            OperatorInvocation::BinaryToken,
             spelling,
+            false,
+            false,
             &[builtins.integer, builtins.integer],
             Some(builtins.boolean),
         );
     }
     for spelling in ["and", "or", "xor"] {
-        callable(
+        operator_callable(
             binder,
+            OperatorInvocation::BinaryToken,
             spelling,
+            false,
+            false,
             &[builtins.integer, builtins.integer],
             Some(builtins.integer),
         );
-        callable(
+        operator_callable(
             binder,
+            OperatorInvocation::BinaryToken,
             spelling,
+            false,
+            true,
             &[builtins.boolean, builtins.boolean],
             Some(builtins.boolean),
         );
     }
-    callable(binder, "not", &[builtins.boolean], Some(builtins.boolean));
-    callable(binder, ":=", &[builtins.integer, builtins.integer], None);
-    callable(binder, "high", &[builtins.integer], Some(builtins.integer));
+    operator_callable(
+        binder,
+        OperatorInvocation::UnaryToken,
+        "not",
+        false,
+        true,
+        &[builtins.boolean],
+        Some(builtins.boolean),
+    );
+    let assignment = binder.scopes.intern_name(":builtin_assign");
+    callable(
+        binder,
+        assignment,
+        &[builtins.integer, builtins.integer],
+        None,
+    );
+    let high = binder.scopes.intern_name("high");
+    callable(binder, high, &[builtins.integer], Some(builtins.integer));
 }
 
 fn install_builtins(binder: &mut SemanticBinder) -> BuiltinTypes {

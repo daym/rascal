@@ -1,6 +1,6 @@
 use super::{
-    CallableFlavor, ExplicitConversion, ParameterMode, ReceiverId, SymbolId, TypeRef, TypeRegistry,
-    ValueConversion,
+    CallableFlavor, ConstantValue, ExplicitConversion, ParameterMode, ReceiverId, SymbolId,
+    TypeRef, TypeRegistry, ValueConversion,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,10 +76,11 @@ pub struct ArgumentBinding {
     pub conversion: Option<ArgumentConversion>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DefaultArgumentBinding {
     pub formal_index: usize,
     pub formal_type: TypeRef,
+    pub value: ConstantValue,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -272,7 +273,7 @@ impl<'a> ApplicationResolver<'a> {
             .signature
             .parameters
             .iter()
-            .rposition(|parameter| !parameter.has_default)
+            .rposition(|parameter| parameter.default.is_none())
             .map_or(0, |index| index + 1);
         let maximum = callable.signature.parameters.len();
         if actuals.len() < minimum || actuals.len() > maximum {
@@ -360,9 +361,10 @@ impl<'a> ApplicationResolver<'a> {
                 .iter()
                 .enumerate()
                 .filter_map(|(offset, formal)| {
-                    formal.has_default.then_some(DefaultArgumentBinding {
+                    formal.default.clone().map(|value| DefaultArgumentBinding {
                         formal_index: actuals.len() + offset,
                         formal_type: formal.ty,
+                        value,
                     })
                 })
                 .collect()
@@ -512,7 +514,7 @@ mod tests {
                         .map(|(ty, has_default)| FormalParameter {
                             mode: ParameterMode::Value,
                             ty: *ty,
-                            has_default: *has_default,
+                            default: has_default.then_some(ConstantValue::Integer(0)),
                         })
                         .collect(),
                     result,

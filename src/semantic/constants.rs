@@ -1,0 +1,365 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::{Literal, ModeSnapshot, Operator};
+
+use super::{
+    ApplicationSelection, BoundApplicationTarget, BoundExpression, BoundExpressionKind,
+    BoundSetElement, SymbolId, TypeRef, TypeRegistry,
+};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConstantValue {
+    Integer(i128),
+    Boolean(bool),
+    Character(char),
+    String(String),
+    Real(String),
+    Nil,
+    Set(BTreeSet<i128>),
+}
+
+impl ConstantValue {
+    pub const fn ordinal(&self) -> Option<i128> {
+        match self {
+            Self::Integer(value) => Some(*value),
+            Self::Boolean(value) => Some(*value as i128),
+            Self::Character(value) => Some(*value as i128),
+            Self::String(_) | Self::Real(_) | Self::Nil | Self::Set(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConstantEntry {
+    pub ty: TypeRef,
+    pub value: ConstantValue,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ConstantRegistry {
+    entries: BTreeMap<SymbolId, ConstantEntry>,
+}
+
+impl ConstantRegistry {
+    pub fn insert(&mut self, symbol: SymbolId, entry: ConstantEntry) {
+        self.entries.insert(symbol, entry);
+    }
+
+    pub fn get(&self, symbol: SymbolId) -> Option<&ConstantEntry> {
+        self.entries.get(&symbol)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConstantEvaluationError {
+    NotConstant,
+    MissingType,
+    UnresolvedApplication,
+    InvalidOperand,
+    DivisionByZero,
+    Overflow,
+    ReversedRange,
+    OutsideOrdinalDomain { value: i128, target: TypeRef },
+}
+
+pub struct ConstantEvaluator<'a> {
+    constants: &'a ConstantRegistry,
+    types: &'a TypeRegistry,
+}
+
+impl<'a> ConstantEvaluator<'a> {
+    pub const fn new(constants: &'a ConstantRegistry, types: &'a TypeRegistry) -> Self {
+        Self { constants, types }
+    }
+
+    pub fn evaluate(
+        &self,
+        expression: &BoundExpression,
+        expected: Option<TypeRef>,
+    ) -> Result<ConstantEntry, ConstantEvaluationError> {
+        match &expression.kind {
+            BoundExpressionKind::Literal(literal) => {
+                let ty = expected
+                    .or(expression.ty)
+                    .ok_or(ConstantEvaluationError::MissingType)?;
+                let value = match literal {
+                    Literal::Integer(value) => ConstantValue::Integer(*value),
+                    Literal::Real(value) => ConstantValue::Real(value.clone()),
+                    Literal::String(value)
+                        if expression.ty == Some(ty) && value.chars().count() == 1 =>
+                    {
+                        ConstantValue::Character(value.chars().next().unwrap())
+                    }
+                    Literal::String(value) => ConstantValue::String(value.clone()),
+                    Literal::Boolean(value) => ConstantValue::Boolean(*value),
+                    Literal::Nil => ConstantValue::Nil,
+                };
+                self.convert(ConstantEntry { ty, value }, ty, ModeSnapshot::default())
+            }
+            BoundExpressionKind::Symbol { symbol, .. } => {
+                let entry = self
+                    .constants
+                    .get(*symbol)
+                    .cloned()
+                    .ok_or(ConstantEvaluationError::NotConstant)?;
+                if let Some(expected) = expected {
+                    self.convert(entry, expected, ModeSnapshot::default())
+                } else {
+                    Ok(entry)
+                }
+            }
+            BoundExpressionKind::Application {
+                target,
+                operands,
+                modes,
+                ..
+            } => {
+                if !application_selected(target) {
+                    return Err(ConstantEvaluationError::UnresolvedApplication);
+                }
+                match target {
+                    BoundApplicationTarget::Operator { operator, .. } => {
+                        self.evaluate_operator(*operator, operands, expression.ty, expected, *modes)
+                    }
+                    BoundApplicationTarget::Conversion { destination, .. } => {
+                        let source = operands
+                            .first()
+                            .ok_or(ConstantEvaluationError::InvalidOperand)?;
+                        let value = self.evaluate(source, source.ty)?;
+                        self.convert(value, *destination, *modes)
+                    }
+                    BoundApplicationTarget::Routine { .. }
+                    | BoundApplicationTarget::CallableValue { .. }
+                    | BoundApplicationTarget::Invalid => Err(ConstantEvaluationError::NotConstant),
+                }
+            }
+            BoundExpressionKind::Set(elements) => {
+                let target = expected
+                    .or(expression.ty)
+                    .ok_or(ConstantEvaluationError::MissingType)?;
+                let element_type = self
+                    .types
+                    .set_element_type(target)
+                    .ok_or(ConstantEvaluationError::InvalidOperand)?;
+                let domain = self
+                    .types
+                    .ordinal_domain(element_type)
+                    .ok_or(ConstantEvaluationError::InvalidOperand)?;
+                let mut values = BTreeSet::new();
+                for element in elements {
+                    match element {
+                        BoundSetElement::Value(value) => {
+                            let value = self
+                                .evaluate(value, Some(element_type))?
+                                .value
+                                .ordinal()
+                                .ok_or(ConstantEvaluationError::InvalidOperand)?;
+                            if !domain.contains(value) {
+                                return Err(ConstantEvaluationError::OutsideOrdinalDomain {
+                                    value,
+                                    target: element_type,
+                                });
+                            }
+                            values.insert(value);
+                        }
+                        BoundSetElement::Range { low, high } => {
+                            let low = self
+                                .evaluate(low, Some(element_type))?
+                                .value
+                                .ordinal()
+                                .ok_or(ConstantEvaluationError::InvalidOperand)?;
+                            let high = self
+                                .evaluate(high, Some(element_type))?
+                                .value
+                                .ordinal()
+                                .ok_or(ConstantEvaluationError::InvalidOperand)?;
+                            if low > high {
+                                return Err(ConstantEvaluationError::ReversedRange);
+                            }
+                            if !domain.contains(low) || !domain.contains(high) {
+                                return Err(ConstantEvaluationError::OutsideOrdinalDomain {
+                                    value: if !domain.contains(low) { low } else { high },
+                                    target: element_type,
+                                });
+                            }
+                            values.extend(low..=high);
+                        }
+                    }
+                }
+                Ok(ConstantEntry {
+                    ty: target,
+                    value: ConstantValue::Set(values),
+                })
+            }
+            BoundExpressionKind::Member { .. }
+            | BoundExpressionKind::Index { .. }
+            | BoundExpressionKind::Dereference(_)
+            | BoundExpressionKind::Error => Err(ConstantEvaluationError::NotConstant),
+        }
+    }
+
+    fn evaluate_operator(
+        &self,
+        operator: Operator,
+        operands: &[BoundExpression],
+        expression_type: Option<TypeRef>,
+        expected: Option<TypeRef>,
+        modes: ModeSnapshot,
+    ) -> Result<ConstantEntry, ConstantEvaluationError> {
+        let values = operands
+            .iter()
+            .map(|operand| self.evaluate(operand, operand.ty))
+            .collect::<Result<Vec<_>, _>>()?;
+        let result_type = expected
+            .or(expression_type)
+            .ok_or(ConstantEvaluationError::MissingType)?;
+        let value = match (operator, values.as_slice()) {
+            (Operator::Positive, [value]) => value.value.clone(),
+            (Operator::Negative, [value]) => ConstantValue::Integer(
+                value
+                    .value
+                    .ordinal()
+                    .ok_or(ConstantEvaluationError::InvalidOperand)?
+                    .checked_neg()
+                    .ok_or(ConstantEvaluationError::Overflow)?,
+            ),
+            (Operator::Not, [value]) => match value.value {
+                ConstantValue::Boolean(value) => ConstantValue::Boolean(!value),
+                _ => ConstantValue::Integer(
+                    !value
+                        .value
+                        .ordinal()
+                        .ok_or(ConstantEvaluationError::InvalidOperand)?,
+                ),
+            },
+            (operator, [left, right]) => {
+                self.evaluate_binary(operator, &left.value, &right.value)?
+            }
+            _ => return Err(ConstantEvaluationError::InvalidOperand),
+        };
+        self.convert(
+            ConstantEntry {
+                ty: result_type,
+                value,
+            },
+            result_type,
+            modes,
+        )
+    }
+
+    fn evaluate_binary(
+        &self,
+        operator: Operator,
+        left: &ConstantValue,
+        right: &ConstantValue,
+    ) -> Result<ConstantValue, ConstantEvaluationError> {
+        if let (ConstantValue::Boolean(left), ConstantValue::Boolean(right)) = (left, right) {
+            return match operator {
+                Operator::And => Ok(ConstantValue::Boolean(*left && *right)),
+                Operator::Or => Ok(ConstantValue::Boolean(*left || *right)),
+                Operator::Xor => Ok(ConstantValue::Boolean(*left ^ *right)),
+                Operator::Equal => Ok(ConstantValue::Boolean(left == right)),
+                Operator::NotEqual => Ok(ConstantValue::Boolean(left != right)),
+                _ => Err(ConstantEvaluationError::InvalidOperand),
+            };
+        }
+        let left = left
+            .ordinal()
+            .ok_or(ConstantEvaluationError::InvalidOperand)?;
+        let right = right
+            .ordinal()
+            .ok_or(ConstantEvaluationError::InvalidOperand)?;
+        match operator {
+            Operator::Add => left
+                .checked_add(right)
+                .map(ConstantValue::Integer)
+                .ok_or(ConstantEvaluationError::Overflow),
+            Operator::Subtract => left
+                .checked_sub(right)
+                .map(ConstantValue::Integer)
+                .ok_or(ConstantEvaluationError::Overflow),
+            Operator::Multiply => left
+                .checked_mul(right)
+                .map(ConstantValue::Integer)
+                .ok_or(ConstantEvaluationError::Overflow),
+            Operator::IntegerDivide => {
+                if right == 0 {
+                    Err(ConstantEvaluationError::DivisionByZero)
+                } else {
+                    left.checked_div(right)
+                        .map(ConstantValue::Integer)
+                        .ok_or(ConstantEvaluationError::Overflow)
+                }
+            }
+            Operator::Modulo => {
+                if right == 0 {
+                    Err(ConstantEvaluationError::DivisionByZero)
+                } else {
+                    left.checked_rem(right)
+                        .map(ConstantValue::Integer)
+                        .ok_or(ConstantEvaluationError::Overflow)
+                }
+            }
+            Operator::And => Ok(ConstantValue::Integer(left & right)),
+            Operator::Or => Ok(ConstantValue::Integer(left | right)),
+            Operator::Xor => Ok(ConstantValue::Integer(left ^ right)),
+            Operator::ShiftLeft => u32::try_from(right)
+                .ok()
+                .and_then(|shift| left.checked_shl(shift))
+                .map(ConstantValue::Integer)
+                .ok_or(ConstantEvaluationError::Overflow),
+            Operator::ShiftRight => u32::try_from(right)
+                .ok()
+                .and_then(|shift| left.checked_shr(shift))
+                .map(ConstantValue::Integer)
+                .ok_or(ConstantEvaluationError::Overflow),
+            Operator::Equal => Ok(ConstantValue::Boolean(left == right)),
+            Operator::NotEqual => Ok(ConstantValue::Boolean(left != right)),
+            Operator::Less => Ok(ConstantValue::Boolean(left < right)),
+            Operator::Greater => Ok(ConstantValue::Boolean(left > right)),
+            Operator::LessEqual => Ok(ConstantValue::Boolean(left <= right)),
+            Operator::GreaterEqual => Ok(ConstantValue::Boolean(left >= right)),
+            Operator::Assign
+            | Operator::RealDivide
+            | Operator::Positive
+            | Operator::Negative
+            | Operator::Not
+            | Operator::Address
+            | Operator::ProcedureSlotAddress
+            | Operator::In
+            | Operator::Is
+            | Operator::As => Err(ConstantEvaluationError::InvalidOperand),
+        }
+    }
+
+    fn convert(
+        &self,
+        mut entry: ConstantEntry,
+        destination: TypeRef,
+        modes: ModeSnapshot,
+    ) -> Result<ConstantEntry, ConstantEvaluationError> {
+        if let Some(value) = entry.value.ordinal()
+            && let Some(domain) = self.types.ordinal_domain(destination)
+            && !domain.contains(value)
+            && (modes.range_checks || modes.overflow_checks)
+        {
+            return Err(ConstantEvaluationError::OutsideOrdinalDomain {
+                value,
+                target: destination,
+            });
+        }
+        entry.ty = destination;
+        Ok(entry)
+    }
+}
+
+fn application_selected(target: &BoundApplicationTarget) -> bool {
+    let selection = match target {
+        BoundApplicationTarget::Routine { resolution }
+        | BoundApplicationTarget::CallableValue { resolution }
+        | BoundApplicationTarget::Conversion { resolution, .. }
+        | BoundApplicationTarget::Operator { resolution, .. } => &resolution.selection,
+        BoundApplicationTarget::Invalid => return false,
+    };
+    matches!(selection, ApplicationSelection::Selected { .. })
+}

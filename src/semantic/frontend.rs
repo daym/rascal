@@ -4,9 +4,9 @@ use crate::{
     Application, Callee, CaseLabel, Diagnostic, Expr, ExprKind, Literal, Operator, PascalFile,
     PascalFileKind, PascalSectionKind, Span, Statement, Token, TryContinuation, chumsky_parser,
     declaration_ast::{
-        AggregateSyntaxKind, CallingConventionSyntax, DeclarationSyntax, FormalModeSyntax,
-        FormalParameterSyntax, RoutineDeclarationSyntax, RoutineSyntaxKind, SpannedName,
-        TypeDeclarationSyntax, TypeSyntax, TypeSyntaxKind, ValueDeclarationSyntax,
+        AggregateSyntaxKind, CallingConventionSyntax, DeclarationSyntax, EnumMemberSyntax,
+        FormalModeSyntax, FormalParameterSyntax, RoutineDeclarationSyntax, RoutineSyntaxKind,
+        SpannedName, TypeDeclarationSyntax, TypeSyntax, TypeSyntaxKind, ValueDeclarationSyntax,
     },
     declaration_parser::{parse_file_declarations, section_tokens},
     pascal_parser,
@@ -16,15 +16,16 @@ use super::{
     ActualArgument, AggregateDefinition, AggregateKind, AliasType, ApplicationCandidate,
     ApplicationReceiver, ApplicationResolution, ApplicationResolver, ApplicationSelection,
     ArrayType, BindError, BoundApplicationTarget, BoundBody, BoundCaseArm, BoundCaseLabel,
-    BoundExceptionHandler, BoundExpression, BoundExpressionKind, BoundStatement,
+    BoundExceptionHandler, BoundExpression, BoundExpressionKind, BoundSetElement, BoundStatement,
     BoundStatementKind, BoundTryContinuation, CallableFlavor, CallableType, CallingConvention,
-    Capture, DeclarationMode, DeclarationState, DeclaredRoutine, EnvironmentId,
-    EnvironmentRequirement, FieldLayout, FormalParameter, FrameKind, IncompleteReason,
-    LookupBarrier, LookupEdge, LookupRequest, LookupResult, ModuleGraphError, ModuleId,
-    ModulePhase, ModuleRegistry, NameId, NodeId, OpaqueType, ParameterMode, PointerType,
-    PrimitiveKind, PrimitiveType, ReceiverId, RegionOwner, RoutineOwner, RoutineSignature,
-    SemanticBinder, StorageLayout, SymbolCategory, SymbolFilter, SymbolId, SymbolKind, TypeOwner,
-    TypeRef,
+    Capture, ConstantEntry, ConstantEvaluator, ConstantValue, DeclarationMode, DeclarationState,
+    DeclaredRoutine, EnumMember, EnumType, EnvironmentId, EnvironmentRequirement, FieldLayout,
+    FormalParameter, FrameKind, IncompleteReason, LookupBarrier, LookupEdge, LookupRequest,
+    LookupResult, ModuleGraphError, ModuleId, ModulePhase, ModuleRegistry, NameId, NodeId,
+    OpaqueType, OrdinalDomain, ParameterMode, PointerType, PrimitiveKind, PrimitiveType,
+    ReceiverId, RegionOwner, RoutineOwner, RoutineSignature, SemanticBinder, SetType,
+    StorageLayout, SubrangeType, SymbolCategory, SymbolFilter, SymbolId, SymbolKind, TypeOwner,
+    TypeRef, UnitType, VariantAlternative, VariantPart,
 };
 
 #[derive(Clone, Debug)]
@@ -50,6 +51,7 @@ pub struct SemanticCompilation {
 struct BuiltinTypes {
     integer: TypeRef,
     boolean: TypeRef,
+    character: TypeRef,
     string: TypeRef,
     untyped_parameter: TypeRef,
 }
@@ -400,11 +402,25 @@ impl CompilationDriver {
                     self.bind_error(declaration.span.clone(), error);
                 }
             }
+            TypeSyntaxKind::Enumeration(members) => {
+                self.bind_enumeration(name, members, declaration);
+            }
+            TypeSyntaxKind::Subrange { lower, upper } => {
+                self.bind_subrange(name, lower, upper, declaration);
+            }
             TypeSyntaxKind::Aggregate {
                 kind,
                 base,
                 members,
-            } => self.bind_aggregate(name, *kind, base.as_deref(), members, declaration),
+                variant,
+            } => self.bind_aggregate(
+                name,
+                *kind,
+                base.as_deref(),
+                members,
+                variant.as_deref(),
+                declaration,
+            ),
             TypeSyntaxKind::Named(_) => {
                 let Some(target) = self.resolve_type(&declaration.ty) else {
                     self.define_error_type(name, declaration.span.clone());
@@ -451,38 +467,269 @@ impl CompilationDriver {
                     self.bind_error(declaration.span.clone(), error);
                 }
             }
-            TypeSyntaxKind::Array { element, dynamic } => {
-                let element = element
+            TypeSyntaxKind::Array {
+                indices,
+                element,
+                dynamic,
+            } => {
+                let Some(element) = element
                     .as_deref()
                     .and_then(|element| self.resolve_type(element))
-                    .unwrap_or(self.builtins.integer);
-                let implementation = ArrayType {
-                    element,
-                    index: self.builtins.integer,
-                    length: self.builtins.integer,
-                    layout: (!dynamic).then_some(StorageLayout {
-                        size: 0,
-                        alignment: 1,
-                    }),
-                    resizable: *dynamic,
-                    open: false,
+                else {
+                    self.define_error_type(name, declaration.span.clone());
+                    return;
+                };
+                let Some(implementation) =
+                    self.build_array_implementation(indices, element, *dynamic)
+                else {
+                    self.define_error_type(name, declaration.span.clone());
+                    return;
                 };
                 if let Err(error) = self.binder.define_type(name, implementation) {
                     self.bind_error(declaration.span.clone(), error);
                 }
             }
-            TypeSyntaxKind::Set { .. } | TypeSyntaxKind::Unsupported(_) => {
-                if matches!(declaration.ty.kind, TypeSyntaxKind::Unsupported(_)) {
+            TypeSyntaxKind::Set { element } => {
+                let Some(element) = element
+                    .as_deref()
+                    .and_then(|element| self.resolve_type(element))
+                else {
+                    self.define_error_type(name, declaration.span.clone());
+                    return;
+                };
+                let Some(domain) = self.binder.types.ordinal_domain(element) else {
                     self.diagnostics.push(Diagnostic::new(
                         declaration.ty.span.clone(),
-                        "unsupported type syntax bound as an opaque error type",
+                        "set element type must be ordinal",
                     ));
+                    self.define_error_type(name, declaration.span.clone());
+                    return;
+                };
+                let bytes = domain
+                    .cardinality()
+                    .and_then(|bits| bits.checked_add(7))
+                    .map(|bits| bits / 8)
+                    .and_then(|bytes| u64::try_from(bytes).ok())
+                    .unwrap_or(0);
+                if let Err(error) = self.binder.define_type(
+                    name,
+                    SetType {
+                        element,
+                        domain,
+                        layout: StorageLayout {
+                            size: bytes,
+                            alignment: 1,
+                        },
+                    },
+                ) {
+                    self.bind_error(declaration.span.clone(), error);
                 }
+            }
+            TypeSyntaxKind::Unsupported(_) => {
+                self.diagnostics.push(Diagnostic::new(
+                    declaration.ty.span.clone(),
+                    "unsupported type syntax bound as an opaque error type",
+                ));
                 if let Err(error) = self.binder.define_type(name, opaque_type()) {
                     self.bind_error(declaration.span.clone(), error);
                 }
             }
         }
+    }
+
+    fn bind_enumeration(
+        &mut self,
+        name: NameId,
+        syntax_members: &[EnumMemberSyntax],
+        declaration: &TypeDeclarationSyntax,
+    ) {
+        let declared = match self.binder.define_type(
+            name,
+            EnumType {
+                members: Vec::new(),
+                domain: OrdinalDomain { lower: 0, upper: 0 },
+                layout: StorageLayout {
+                    size: 4,
+                    alignment: 4,
+                },
+            },
+        ) {
+            Ok(declared) => declared,
+            Err(error) => {
+                self.bind_error(declaration.span.clone(), error);
+                return;
+            }
+        };
+        let mut members = Vec::new();
+        let mut previous = None;
+        for syntax in syntax_members {
+            let value = if let Some(expression) = &syntax.value {
+                let Some(entry) = self.evaluate_constant_expression(expression, None) else {
+                    continue;
+                };
+                let Some(value) = entry.value.ordinal() else {
+                    self.diagnostics.push(Diagnostic::new(
+                        syntax.span.clone(),
+                        "explicit enum value must be an ordinal constant",
+                    ));
+                    continue;
+                };
+                value
+            } else {
+                previous.map_or(0, |value: i128| value.saturating_add(1))
+            };
+            if previous.is_some_and(|previous| value <= previous) {
+                self.diagnostics.push(Diagnostic::new(
+                    syntax.span.clone(),
+                    "explicit enum values must ascend",
+                ));
+                continue;
+            }
+            let member_name = self.binder.scopes.intern_name(&syntax.name.spelling);
+            match self.binder.scopes.declare(
+                member_name,
+                SymbolKind::Constant(declared.ty),
+                DeclarationState::Complete,
+                DeclarationMode::Fresh,
+            ) {
+                Ok(symbol) => {
+                    self.binder.constants.insert(
+                        symbol,
+                        ConstantEntry {
+                            ty: declared.ty,
+                            value: ConstantValue::Integer(value),
+                        },
+                    );
+                    members.push(EnumMember {
+                        name: member_name,
+                        value,
+                    });
+                    previous = Some(value);
+                }
+                Err(error) => self.bind_error(syntax.span.clone(), error.into()),
+            }
+        }
+        let domain = members.first().zip(members.last()).map_or(
+            OrdinalDomain { lower: 0, upper: 0 },
+            |(first, last)| OrdinalDomain {
+                lower: first.value,
+                upper: last.value,
+            },
+        );
+        if let Err(error) = self
+            .binder
+            .types
+            .set_enum_members(declared.ty, members, domain)
+        {
+            self.bind_error(declaration.span.clone(), error.into());
+        }
+    }
+
+    fn bind_subrange(
+        &mut self,
+        name: NameId,
+        lower: &Expr,
+        upper: &Expr,
+        declaration: &TypeDeclarationSyntax,
+    ) {
+        let Some(lower) = self.evaluate_constant_expression(lower, None) else {
+            self.define_error_type(name, declaration.span.clone());
+            return;
+        };
+        let Some(upper) = self.evaluate_constant_expression(upper, Some(lower.ty)) else {
+            self.define_error_type(name, declaration.span.clone());
+            return;
+        };
+        let (Some(lower_value), Some(upper_value)) = (lower.value.ordinal(), upper.value.ordinal())
+        else {
+            self.diagnostics.push(Diagnostic::new(
+                declaration.span.clone(),
+                "subrange bounds must be ordinal constants",
+            ));
+            self.define_error_type(name, declaration.span.clone());
+            return;
+        };
+        let lower_base = self.binder.types.ordinal_base_type(lower.ty);
+        let upper_base = self.binder.types.ordinal_base_type(upper.ty);
+        if lower_base.is_none() || lower_base != upper_base || lower_value > upper_value {
+            self.diagnostics.push(Diagnostic::new(
+                declaration.span.clone(),
+                "subrange bounds require one compatible ordinal base and ascending values",
+            ));
+            self.define_error_type(name, declaration.span.clone());
+            return;
+        }
+        let base = lower_base.unwrap();
+        let layout = self
+            .binder
+            .types
+            .storage_layout(base)
+            .unwrap_or(StorageLayout {
+                size: 4,
+                alignment: 4,
+            });
+        if let Err(error) = self.binder.define_type(
+            name,
+            SubrangeType {
+                base,
+                domain: OrdinalDomain {
+                    lower: lower_value,
+                    upper: upper_value,
+                },
+                layout,
+            },
+        ) {
+            self.bind_error(declaration.span.clone(), error);
+        }
+    }
+
+    fn build_array_implementation(
+        &mut self,
+        indices: &[TypeSyntax],
+        element: TypeRef,
+        dynamic: bool,
+    ) -> Option<ArrayType> {
+        if dynamic {
+            return Some(ArrayType {
+                element,
+                index: self.builtins.integer,
+                length: self.builtins.integer,
+                layout: None,
+                resizable: true,
+                open: false,
+            });
+        }
+        let resolved = indices
+            .iter()
+            .map(|index| self.resolve_type(index))
+            .collect::<Option<Vec<_>>>()?;
+        if resolved.is_empty() {
+            return None;
+        }
+        let mut current_element = element;
+        for (position, index) in resolved.iter().enumerate().rev() {
+            let cardinality = self.binder.types.ordinal_domain(*index)?.cardinality()?;
+            let element_layout = self.binder.types.storage_layout(current_element)?;
+            let size = u64::try_from(cardinality)
+                .ok()?
+                .checked_mul(element_layout.size)?;
+            let implementation = ArrayType {
+                element: current_element,
+                index: *index,
+                length: self.builtins.integer,
+                layout: Some(StorageLayout {
+                    size,
+                    alignment: element_layout.alignment,
+                }),
+                resizable: false,
+                open: false,
+            };
+            if position == 0 {
+                return Some(implementation);
+            }
+            current_element = self.allocate_anonymous(implementation);
+        }
+        None
     }
 
     fn bind_aggregate(
@@ -491,6 +738,7 @@ impl CompilationDriver {
         syntax_kind: AggregateSyntaxKind,
         base_syntax: Option<&TypeSyntax>,
         members: &[DeclarationSyntax],
+        variant: Option<&crate::declaration_ast::VariantPartSyntax>,
         declaration: &TypeDeclarationSyntax,
     ) {
         let base = base_syntax.and_then(|base| self.resolve_type(base));
@@ -510,7 +758,7 @@ impl CompilationDriver {
         } else {
             StorageLayout {
                 size: 0,
-                alignment: usize_alignment(),
+                alignment: 1,
             }
         };
         let mut aggregate = match self.binder.begin_aggregate(name, kind, layout) {
@@ -525,9 +773,99 @@ impl CompilationDriver {
             RoutineOwner::Type(aggregate.declared.ty),
             Some(&mut aggregate),
         );
-        if let Err(error) = self.binder.end_aggregate(aggregate, None) {
+        let variant = variant.and_then(|variant| self.bind_variant_part(variant, &mut aggregate));
+        if matches!(
+            aggregate.kind,
+            AggregateKind::RegularRecord | AggregateKind::Object { .. }
+        ) {
+            aggregate.layout.size = align_up(aggregate.layout.size, aggregate.layout.alignment);
+        }
+        if let Err(error) = self.binder.end_aggregate(aggregate, variant) {
             self.bind_error(declaration.span.clone(), error);
         }
+    }
+
+    fn bind_variant_part(
+        &mut self,
+        syntax: &crate::declaration_ast::VariantPartSyntax,
+        aggregate: &mut AggregateDefinition,
+    ) -> Option<VariantPart> {
+        let selector_type = self.resolve_type(&syntax.selector_type)?;
+        let domain = self.binder.types.ordinal_domain(selector_type);
+        if domain.is_none() {
+            self.diagnostics.push(Diagnostic::new(
+                syntax.selector_type.span.clone(),
+                "variant selector type must be ordinal",
+            ));
+            return None;
+        }
+        let selector = syntax.selector_name.as_ref().and_then(|selector| {
+            let before = aggregate.fields.len();
+            let declaration = ValueDeclarationSyntax {
+                names: vec![selector.clone()],
+                ty: Some((*syntax.selector_type).clone()),
+                initializer: None,
+                span: selector.span.clone(),
+                modes: syntax.selector_type.modes,
+            };
+            self.bind_fields(&declaration, aggregate);
+            aggregate.fields.get(before).cloned()
+        });
+        let payload_offset = aggregate.layout.size;
+        let mut alternatives = Vec::new();
+        let mut maximum_end = payload_offset;
+        let mut labels_seen = BTreeSet::new();
+        for alternative in &syntax.alternatives {
+            let mut labels = Vec::new();
+            for label in &alternative.labels {
+                let Some(entry) = self.evaluate_constant_expression(label, Some(selector_type))
+                else {
+                    continue;
+                };
+                let Some(value) = entry.value.ordinal() else {
+                    self.diagnostics.push(Diagnostic::new(
+                        label.span.clone(),
+                        "variant label must be an ordinal constant",
+                    ));
+                    continue;
+                };
+                if !domain.is_some_and(|domain| domain.contains(value)) {
+                    self.diagnostics.push(Diagnostic::new(
+                        label.span.clone(),
+                        "variant label is outside the selector domain",
+                    ));
+                    continue;
+                }
+                if !labels_seen.insert(value) {
+                    self.diagnostics.push(Diagnostic::new(
+                        label.span.clone(),
+                        "duplicate variant label",
+                    ));
+                    continue;
+                }
+                labels.push(value);
+            }
+            aggregate.layout.size = payload_offset;
+            let field_start = aggregate.fields.len();
+            self.bind_declarations(
+                &alternative.members,
+                RoutineOwner::Type(aggregate.declared.ty),
+                Some(aggregate),
+            );
+            maximum_end = maximum_end.max(aggregate.layout.size);
+            alternatives.push(VariantAlternative {
+                labels,
+                fields: aggregate.fields[field_start..].to_vec(),
+            });
+        }
+        aggregate.layout.size = maximum_end;
+        Some(VariantPart {
+            selector,
+            alternatives,
+            byte_offset: payload_offset,
+            byte_size: maximum_end.saturating_sub(payload_offset),
+            alignment: aggregate.layout.alignment,
+        })
     }
 
     fn bind_fields(
@@ -546,33 +884,99 @@ impl CompilationDriver {
             ));
             return;
         };
-        let field_layout = FieldLayout {
-            byte_offset: aggregate.fields.len() as u64
-                * self
-                    .binder
-                    .types
-                    .storage_layout(ty)
-                    .map_or(1, |layout| layout.size),
-            bit_offset: 0,
-            bit_width: None,
-        };
+        let storage = self
+            .binder
+            .types
+            .storage_layout(ty)
+            .unwrap_or(StorageLayout {
+                size: 0,
+                alignment: 1,
+            });
         for name in &declaration.names {
+            let byte_offset = match aggregate.kind {
+                AggregateKind::PackedRecord => aggregate.layout.size,
+                AggregateKind::RegularRecord | AggregateKind::Object { .. } => {
+                    align_up(aggregate.layout.size, storage.alignment)
+                }
+                AggregateKind::Class { .. } => aggregate.fields.last().map_or(0, |field| {
+                    field.layout.byte_offset
+                        + self
+                            .binder
+                            .types
+                            .storage_layout(field.ty)
+                            .map_or(0, |layout| layout.size)
+                }),
+            };
+            let field_layout = FieldLayout {
+                byte_offset,
+                bit_offset: 0,
+                bit_width: None,
+            };
             let name_id = self.binder.scopes.intern_name(&name.spelling);
             if let Err(error) = self
                 .binder
                 .declare_field(aggregate, name_id, ty, field_layout)
             {
                 self.bind_error(name.span.clone(), error);
+            } else if !matches!(aggregate.kind, AggregateKind::Class { .. }) {
+                aggregate.layout.size = byte_offset.saturating_add(storage.size);
+                if !matches!(aggregate.kind, AggregateKind::PackedRecord) {
+                    aggregate.layout.alignment = aggregate.layout.alignment.max(storage.alignment);
+                }
             }
         }
     }
 
     fn bind_values(&mut self, declaration: &ValueDeclarationSyntax, constant: bool) {
-        let ty = declaration
+        let explicit_type = declaration
             .ty
             .as_ref()
-            .and_then(|syntax| self.resolve_type(syntax))
+            .and_then(|syntax| self.resolve_type(syntax));
+        let initializer = declaration
+            .initializer
+            .as_ref()
+            .map(|initializer| self.bind_expression(initializer, None));
+        let constant_entry = if constant {
+            initializer.as_ref().and_then(|initializer| {
+                let evaluator = ConstantEvaluator::new(&self.binder.constants, &self.binder.types);
+                match evaluator.evaluate(initializer, explicit_type) {
+                    Ok(entry) => Some(entry),
+                    Err(error) => {
+                        self.diagnostics.push(Diagnostic::new(
+                            initializer.span.clone(),
+                            format!("constant expression: {error:?}"),
+                        ));
+                        None
+                    }
+                }
+            })
+        } else {
+            None
+        };
+        let ty = explicit_type
+            .or_else(|| constant_entry.as_ref().map(|entry| entry.ty))
+            .or_else(|| initializer.as_ref().and_then(|initializer| initializer.ty))
             .unwrap_or(self.builtins.integer);
+        if constant && initializer.is_none() {
+            self.diagnostics.push(Diagnostic::new(
+                declaration.span.clone(),
+                "constant declaration requires an initializer",
+            ));
+        }
+        if !constant
+            && let Some(initializer_type) =
+                initializer.as_ref().and_then(|initializer| initializer.ty)
+            && self
+                .binder
+                .types
+                .value_conversion(ty, initializer_type)
+                .is_none()
+        {
+            self.diagnostics.push(Diagnostic::new(
+                declaration.span.clone(),
+                "variable initializer is not convertible to its declared type",
+            ));
+        }
         self.binder.scopes.extend_environment(if constant {
             FrameKind::ConstSection
         } else {
@@ -585,14 +989,80 @@ impl CompilationDriver {
             } else {
                 SymbolKind::Variable(ty)
             };
-            if let Err(error) = self.binder.scopes.declare(
+            match self.binder.scopes.declare(
                 name_id,
                 kind,
                 DeclarationState::Complete,
                 DeclarationMode::Fresh,
             ) {
-                self.bind_error(name.span.clone(), error.into());
+                Ok(symbol) => {
+                    if let Some(entry) = constant_entry.clone() {
+                        self.binder.constants.insert(symbol, entry);
+                    }
+                }
+                Err(error) => self.bind_error(name.span.clone(), error.into()),
             }
+        }
+    }
+
+    fn evaluate_constant_expression(
+        &mut self,
+        expression: &Expr,
+        expected: Option<TypeRef>,
+    ) -> Option<ConstantEntry> {
+        let bound = self.bind_expression(expression, None);
+        let evaluator = ConstantEvaluator::new(&self.binder.constants, &self.binder.types);
+        match evaluator.evaluate(&bound, expected) {
+            Ok(entry) => Some(entry),
+            Err(error) => {
+                self.diagnostics.push(Diagnostic::new(
+                    expression.span.clone(),
+                    format!("constant expression: {error:?}"),
+                ));
+                None
+            }
+        }
+    }
+
+    fn evaluate_bound_ordinal(
+        &mut self,
+        expression: &BoundExpression,
+        expected: Option<TypeRef>,
+    ) -> Option<i128> {
+        let evaluator = ConstantEvaluator::new(&self.binder.constants, &self.binder.types);
+        match evaluator.evaluate(expression, expected) {
+            Ok(entry) => entry.value.ordinal().or_else(|| {
+                self.diagnostics.push(Diagnostic::new(
+                    expression.span.clone(),
+                    "case label must be an ordinal constant",
+                ));
+                None
+            }),
+            Err(error) => {
+                self.diagnostics.push(Diagnostic::new(
+                    expression.span.clone(),
+                    format!("case label is not constant: {error:?}"),
+                ));
+                None
+            }
+        }
+    }
+
+    fn check_case_interval(
+        &mut self,
+        low: i128,
+        high: i128,
+        span: Span,
+        occupied: &mut Vec<(i128, i128)>,
+    ) {
+        if occupied
+            .iter()
+            .any(|(existing_low, existing_high)| low <= *existing_high && *existing_low <= high)
+        {
+            self.diagnostics
+                .push(Diagnostic::new(span, "duplicate or overlapping case label"));
+        } else {
+            occupied.push((low, high));
         }
     }
 
@@ -761,13 +1231,18 @@ impl CompilationDriver {
                 FormalModeSyntax::Out => ParameterMode::Out,
                 FormalModeSyntax::ConstRef => ParameterMode::ConstRef,
             };
+            let default = parameter
+                .default
+                .as_ref()
+                .and_then(|default| self.evaluate_constant_expression(default, Some(ty)))
+                .map(|entry| entry.value);
             for name in &parameter.names {
                 let name = self.binder.scopes.intern_name(&name.spelling);
                 parameters.push(ResolvedParameter { name, ty });
                 formals.push(FormalParameter {
                     mode,
                     ty,
-                    has_default: parameter.has_default,
+                    default: default.clone(),
                 });
             }
         }
@@ -805,11 +1280,16 @@ impl CompilationDriver {
                 FormalModeSyntax::Out => ParameterMode::Out,
                 FormalModeSyntax::ConstRef => ParameterMode::ConstRef,
             };
+            let default = parameter
+                .default
+                .as_ref()
+                .and_then(|default| self.evaluate_constant_expression(default, Some(ty)))
+                .map(|entry| entry.value);
             for _ in &parameter.names {
                 formals.push(FormalParameter {
                     mode,
                     ty,
-                    has_default: parameter.has_default,
+                    default: default.clone(),
                 });
             }
         }
@@ -994,26 +1474,67 @@ impl CompilationDriver {
                 span,
             } => {
                 let selector = self.bind_expression(selector, owner);
-                let arms = arms
-                    .iter()
-                    .map(|arm| BoundCaseArm {
-                        labels: arm
-                            .labels
-                            .iter()
-                            .map(|label| match label {
-                                CaseLabel::Value(value) => {
-                                    BoundCaseLabel::Value(self.bind_expression(value, owner))
+                let selector_type = selector.ty;
+                if selector_type
+                    .and_then(|ty| self.binder.types.ordinal_domain(ty))
+                    .is_none()
+                {
+                    self.diagnostics.push(Diagnostic::new(
+                        selector.span.clone(),
+                        "case selector must have an ordinal type",
+                    ));
+                }
+                let mut occupied = Vec::<(i128, i128)>::new();
+                let mut bound_arms = Vec::new();
+                for arm in arms {
+                    let mut labels = Vec::new();
+                    for label in &arm.labels {
+                        match label {
+                            CaseLabel::Value(value) => {
+                                let bound = self.bind_expression(value, owner);
+                                if let Some(value) =
+                                    self.evaluate_bound_ordinal(&bound, selector_type)
+                                {
+                                    self.check_case_interval(
+                                        value,
+                                        value,
+                                        bound.span.clone(),
+                                        &mut occupied,
+                                    );
                                 }
-                                CaseLabel::Range { low, high } => BoundCaseLabel::Range {
-                                    low: self.bind_expression(low, owner),
-                                    high: self.bind_expression(high, owner),
-                                },
-                            })
-                            .collect(),
+                                labels.push(BoundCaseLabel::Value(bound));
+                            }
+                            CaseLabel::Range { low, high } => {
+                                let low = self.bind_expression(low, owner);
+                                let high = self.bind_expression(high, owner);
+                                let values = self
+                                    .evaluate_bound_ordinal(&low, selector_type)
+                                    .zip(self.evaluate_bound_ordinal(&high, selector_type));
+                                if let Some((low_value, high_value)) = values {
+                                    if low_value > high_value {
+                                        self.diagnostics.push(Diagnostic::new(
+                                            low.span.start..high.span.end,
+                                            "case label range is reversed",
+                                        ));
+                                    } else {
+                                        self.check_case_interval(
+                                            low_value,
+                                            high_value,
+                                            low.span.start..high.span.end,
+                                            &mut occupied,
+                                        );
+                                    }
+                                }
+                                labels.push(BoundCaseLabel::Range { low, high });
+                            }
+                        }
+                    }
+                    bound_arms.push(BoundCaseArm {
+                        labels,
                         statement: self.bind_scoped_statement(&arm.statement, owner),
                         span: arm.span.clone(),
-                    })
-                    .collect();
+                    });
+                }
                 let otherwise = otherwise
                     .iter()
                     .map(|statement| self.bind_statement(statement, owner))
@@ -1022,7 +1543,7 @@ impl CompilationDriver {
                     span: span.clone(),
                     kind: BoundStatementKind::Case {
                         selector,
-                        arms,
+                        arms: bound_arms,
                         otherwise,
                     },
                 }
@@ -1451,6 +1972,9 @@ impl CompilationDriver {
                 ty: match literal {
                     Literal::Integer(_) => Some(self.builtins.integer),
                     Literal::Boolean(_) => Some(self.builtins.boolean),
+                    Literal::String(value) if value.chars().count() == 1 => {
+                        Some(self.builtins.character)
+                    }
                     Literal::String(_) => Some(self.builtins.string),
                     Literal::Real(_) | Literal::Nil => None,
                 },
@@ -1537,11 +2061,13 @@ impl CompilationDriver {
                 for element in elements {
                     match element {
                         crate::SetElement::Value(value) => {
-                            bound.push(self.bind_expression(value, owner));
+                            bound.push(BoundSetElement::Value(self.bind_expression(value, owner)));
                         }
                         crate::SetElement::Range { low, high } => {
-                            bound.push(self.bind_expression(low, owner));
-                            bound.push(self.bind_expression(high, owner));
+                            bound.push(BoundSetElement::Range {
+                                low: self.bind_expression(low, owner),
+                                high: self.bind_expression(high, owner),
+                            });
                         }
                     }
                 }
@@ -1609,6 +2135,7 @@ impl CompilationDriver {
                         application.span.clone(),
                         operands,
                         owner,
+                        application.modes,
                     );
                 }
                 let callee = self.bind_expression(callee, owner);
@@ -1623,6 +2150,7 @@ impl CompilationDriver {
                             target: BoundApplicationTarget::Invalid,
                             callee: Some(Box::new(callee)),
                             operands,
+                            modes: application.modes,
                         },
                         ty: None,
                         span: application.span.clone(),
@@ -1650,14 +2178,18 @@ impl CompilationDriver {
                         target,
                         callee: Some(Box::new(callee)),
                         operands,
+                        modes: application.modes,
                     },
                     ty: result,
                     span: application.span.clone(),
                 }
             }
-            Callee::Operator(operator) => {
-                self.bind_operator_application(*operator, application.span.clone(), operands)
-            }
+            Callee::Operator(operator) => self.bind_operator_application(
+                *operator,
+                application.span.clone(),
+                operands,
+                application.modes,
+            ),
         }
     }
 
@@ -1667,6 +2199,7 @@ impl CompilationDriver {
         span: Span,
         operands: Vec<BoundExpression>,
         owner: Option<TypeRef>,
+        modes: crate::ModeSnapshot,
     ) -> BoundExpression {
         let name = self.binder.scopes.intern_name(spelling);
         let Some(result) = self.binder.scopes.lookup_symbol(
@@ -1678,7 +2211,7 @@ impl CompilationDriver {
                 span.clone(),
                 format!("unknown application name `{spelling}`"),
             ));
-            return bound_application_error(span, operands);
+            return bound_application_error(span, operands, modes);
         };
         let primary = result.primary[0].symbol;
         let primary_receiver = result.primary[0].receiver;
@@ -1703,6 +2236,7 @@ impl CompilationDriver {
                         },
                         callee: None,
                         operands,
+                        modes,
                     },
                     ty: result_type,
                     span,
@@ -1722,6 +2256,7 @@ impl CompilationDriver {
                         target: BoundApplicationTarget::Routine { resolution },
                         callee: None,
                         operands,
+                        modes,
                     },
                     ty: result_type,
                     span,
@@ -1752,6 +2287,7 @@ impl CompilationDriver {
                         target: BoundApplicationTarget::CallableValue { resolution },
                         callee: None,
                         operands,
+                        modes,
                     },
                     ty: result_type,
                     span,
@@ -1764,7 +2300,7 @@ impl CompilationDriver {
                         "nearest declaration `{spelling}` is not callable and blocks outer declarations"
                     ),
                 ));
-                bound_application_error(span, operands)
+                bound_application_error(span, operands, modes)
             }
         }
     }
@@ -1774,6 +2310,7 @@ impl CompilationDriver {
         operator: Operator,
         span: Span,
         operands: Vec<BoundExpression>,
+        modes: crate::ModeSnapshot,
     ) -> BoundExpression {
         let name = self.binder.scopes.intern_name(operator.spelling());
         let candidates = self
@@ -1805,6 +2342,7 @@ impl CompilationDriver {
                 },
                 callee: None,
                 operands,
+                modes,
             },
             ty: result_type,
             span,
@@ -1922,21 +2460,70 @@ impl CompilationDriver {
                     layout: pointer_layout(),
                 }))
             }
-            TypeSyntaxKind::Array { element, dynamic } => {
+            TypeSyntaxKind::Enumeration(members) => {
+                let mut semantic_members = Vec::new();
+                let mut previous = None;
+                for member in members {
+                    let value = if let Some(value) = &member.value {
+                        self.evaluate_constant_expression(value, None)?
+                            .value
+                            .ordinal()?
+                    } else {
+                        previous.map_or(0, |value: i128| value.saturating_add(1))
+                    };
+                    let name = self.binder.scopes.intern_name(&member.name.spelling);
+                    semantic_members.push(EnumMember { name, value });
+                    previous = Some(value);
+                }
+                let domain = semantic_members
+                    .first()
+                    .zip(semantic_members.last())
+                    .map_or(OrdinalDomain { lower: 0, upper: 0 }, |(first, last)| {
+                        OrdinalDomain {
+                            lower: first.value,
+                            upper: last.value,
+                        }
+                    });
+                Some(self.allocate_anonymous(EnumType {
+                    members: semantic_members,
+                    domain,
+                    layout: StorageLayout {
+                        size: 4,
+                        alignment: 4,
+                    },
+                }))
+            }
+            TypeSyntaxKind::Subrange { lower, upper } => {
+                let lower = self.evaluate_constant_expression(lower, None)?;
+                let upper = self.evaluate_constant_expression(upper, Some(lower.ty))?;
+                let lower_value = lower.value.ordinal()?;
+                let upper_value = upper.value.ordinal()?;
+                let base = self.binder.types.ordinal_base_type(lower.ty)?;
+                if self.binder.types.ordinal_base_type(upper.ty) != Some(base)
+                    || lower_value > upper_value
+                {
+                    return None;
+                }
+                let layout = self.binder.types.storage_layout(base)?;
+                Some(self.allocate_anonymous(SubrangeType {
+                    base,
+                    domain: OrdinalDomain {
+                        lower: lower_value,
+                        upper: upper_value,
+                    },
+                    layout,
+                }))
+            }
+            TypeSyntaxKind::Array {
+                indices,
+                element,
+                dynamic,
+            } => {
                 let element = element
                     .as_deref()
                     .and_then(|syntax| self.resolve_type(syntax))?;
-                Some(self.allocate_anonymous(ArrayType {
-                    element,
-                    index: self.builtins.integer,
-                    length: self.builtins.integer,
-                    layout: (!dynamic).then_some(StorageLayout {
-                        size: 0,
-                        alignment: 1,
-                    }),
-                    resizable: *dynamic,
-                    open: false,
-                }))
+                let implementation = self.build_array_implementation(indices, element, *dynamic)?;
+                Some(self.allocate_anonymous(implementation))
             }
             TypeSyntaxKind::Procedural {
                 method_pointer,
@@ -1966,9 +2553,23 @@ impl CompilationDriver {
                     has_body: false,
                 }))
             }
-            TypeSyntaxKind::Set { .. } | TypeSyntaxKind::Unsupported(_) => {
-                Some(self.allocate_anonymous(opaque_type()))
+            TypeSyntaxKind::Set { element } => {
+                let element = element
+                    .as_deref()
+                    .and_then(|syntax| self.resolve_type(syntax))?;
+                let domain = self.binder.types.ordinal_domain(element)?;
+                let size = domain
+                    .cardinality()?
+                    .checked_add(7)?
+                    .checked_div(8)
+                    .and_then(|size| u64::try_from(size).ok())?;
+                Some(self.allocate_anonymous(SetType {
+                    element,
+                    domain,
+                    layout: StorageLayout { size, alignment: 1 },
+                }))
             }
+            TypeSyntaxKind::Unsupported(_) => Some(self.allocate_anonymous(opaque_type())),
             TypeSyntaxKind::Aggregate { .. } | TypeSyntaxKind::ClassForward => {
                 self.diagnostics.push(Diagnostic::new(
                     syntax.span.clone(),
@@ -2132,12 +2733,17 @@ fn bound_error(span: Span) -> BoundExpression {
     }
 }
 
-fn bound_application_error(span: Span, operands: Vec<BoundExpression>) -> BoundExpression {
+fn bound_application_error(
+    span: Span,
+    operands: Vec<BoundExpression>,
+    modes: crate::ModeSnapshot,
+) -> BoundExpression {
     BoundExpression {
         kind: BoundExpressionKind::Application {
             target: BoundApplicationTarget::Invalid,
             callee: None,
             operands,
+            modes,
         },
         ty: None,
         span,
@@ -2175,8 +2781,11 @@ fn pointer_layout() -> StorageLayout {
     }
 }
 
-fn usize_alignment() -> u32 {
-    8
+fn align_up(offset: u64, alignment: u32) -> u64 {
+    let alignment = u64::from(alignment.max(1));
+    offset
+        .checked_add(alignment - 1)
+        .map_or(offset, |value| value / alignment * alignment)
 }
 
 fn opaque_type() -> OpaqueType {
@@ -2208,7 +2817,7 @@ fn install_system_callables(binder: &mut SemanticBinder, builtins: BuiltinTypes)
                         .map(|ty| FormalParameter {
                             mode: ParameterMode::Value,
                             ty: *ty,
-                            has_default: false,
+                            default: None,
                         })
                         .collect(),
                     result,
@@ -2360,7 +2969,7 @@ fn install_builtins(binder: &mut SemanticBinder) -> BuiltinTypes {
             alignment: 1,
         },
     );
-    let _ = primitive(
+    let character = primitive(
         binder,
         "char",
         PrimitiveKind::Character,
@@ -2386,9 +2995,16 @@ fn install_builtins(binder: &mut SemanticBinder) -> BuiltinTypes {
         binder.scopes.current_environment(),
         opaque_type(),
     );
+    let _unit = binder.types.allocate_complete(
+        TypeOwner::Builtin,
+        None,
+        binder.scopes.current_environment(),
+        UnitType,
+    );
     BuiltinTypes {
         integer,
         boolean,
+        character,
         string,
         untyped_parameter,
     }

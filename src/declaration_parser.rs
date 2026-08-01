@@ -6,7 +6,8 @@ use crate::{
         AggregateSyntaxKind, CallingConventionSyntax, DeclarationParseOutput, DeclarationSyntax,
         EnumMemberSyntax, FormalModeSyntax, FormalParameterSyntax, ParsedDeclarationSection,
         RoutineDeclarationSyntax, RoutineSyntaxKind, SpannedName, TypeDeclarationSyntax,
-        TypeSyntax, TypeSyntaxKind, ValueDeclarationSyntax,
+        TypeSyntax, TypeSyntaxKind, ValueDeclarationSyntax, VariantAlternativeSyntax,
+        VariantPartSyntax,
     },
 };
 
@@ -270,6 +271,24 @@ fn split_top_level(tokens: &[Token], delimiter: TokenKind) -> Vec<&[Token]> {
     parts
 }
 
+fn top_level_position(tokens: &[Token], expected: TokenKind) -> Option<usize> {
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        match token.kind {
+            TokenKind::LeftParen => paren_depth += 1,
+            TokenKind::RightParen => paren_depth = paren_depth.saturating_sub(1),
+            TokenKind::LeftBracket => bracket_depth += 1,
+            TokenKind::RightBracket => bracket_depth = bracket_depth.saturating_sub(1),
+            _ if token.kind == expected && paren_depth == 0 && bracket_depth == 0 => {
+                return Some(index);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn expression_syntax(tokens: &[Token]) -> Option<crate::Expr> {
     let fallback = tokens.last().map_or(0, |token| token.span.end);
     crate::chumsky_parser::parse_expression_tokens(tokens, fallback).0
@@ -288,6 +307,125 @@ fn aggregate_end(tokens: &[Token], opening: usize) -> Option<usize> {
         }
     }
     None
+}
+
+fn variant_case_position(tokens: &[Token]) -> Option<usize> {
+    let mut aggregate_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        if paren_depth == 0
+            && bracket_depth == 0
+            && aggregate_depth == 0
+            && is_keyword(token, "case")
+        {
+            return Some(index);
+        }
+        match token.kind {
+            TokenKind::LeftParen => paren_depth += 1,
+            TokenKind::RightParen => paren_depth = paren_depth.saturating_sub(1),
+            TokenKind::LeftBracket => bracket_depth += 1,
+            TokenKind::RightBracket => bracket_depth = bracket_depth.saturating_sub(1),
+            _ if paren_depth == 0 && bracket_depth == 0 && opens_aggregate(tokens, index) => {
+                aggregate_depth += 1;
+            }
+            _ if paren_depth == 0
+                && bracket_depth == 0
+                && aggregate_depth > 0
+                && is_keyword(token, "end") =>
+            {
+                aggregate_depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_variant_part(tokens: &[Token]) -> Option<VariantPartSyntax> {
+    let case = tokens.first()?;
+    if !is_keyword(case, "case") {
+        return None;
+    }
+    let of = tokens.iter().position(|token| is_keyword(token, "of"))?;
+    let selector = &tokens[1..of];
+    let colon = top_level_position(selector, TokenKind::Colon);
+    let (selector_name, selector_type) = if let Some(colon) = colon {
+        let name = selector.first().and_then(|token| {
+            let TokenKind::Identifier(spelling) = &token.kind else {
+                return None;
+            };
+            Some(SpannedName {
+                spelling: spelling.clone(),
+                span: token.span.clone(),
+            })
+        });
+        (
+            name,
+            parse_type_syntax(
+                selector
+                    .get(colon + 1..)
+                    .filter(|tokens| !tokens.is_empty())?,
+            ),
+        )
+    } else {
+        (None, parse_type_syntax(selector))
+    };
+    let mut alternatives = Vec::new();
+    let mut cursor = of + 1;
+    while cursor < tokens.len() {
+        while tokens
+            .get(cursor)
+            .is_some_and(|token| token.kind == TokenKind::Semicolon)
+        {
+            cursor += 1;
+        }
+        if cursor >= tokens.len() {
+            break;
+        }
+        let label_colon = top_level_position(&tokens[cursor..], TokenKind::Colon)? + cursor;
+        let labels = split_top_level(&tokens[cursor..label_colon], TokenKind::Comma)
+            .into_iter()
+            .map(expression_syntax)
+            .collect::<Option<Vec<_>>>()?;
+        let open = label_colon + 1;
+        if !tokens
+            .get(open)
+            .is_some_and(|token| token.kind == TokenKind::LeftParen)
+        {
+            return None;
+        }
+        let mut depth = 0usize;
+        let mut close = None;
+        for (index, token) in tokens.iter().enumerate().skip(open) {
+            match token.kind {
+                TokenKind::LeftParen => depth += 1,
+                TokenKind::RightParen => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        close = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = close?;
+        let mut scanner = DeclarationScanner::new(&tokens[open + 1..close], false, true);
+        let members = scanner.parse_all();
+        alternatives.push(VariantAlternativeSyntax {
+            labels,
+            members,
+            span: tokens[cursor].span.start..tokens[close].span.end,
+        });
+        cursor = close + 1;
+    }
+    Some(VariantPartSyntax {
+        selector_name,
+        selector_type: Box::new(selector_type),
+        alternatives,
+        span: token_span(tokens, case.span.start),
+    })
 }
 
 fn parse_type_syntax(tokens: &[Token]) -> TypeSyntax {
@@ -320,8 +458,12 @@ fn parse_type_syntax(tokens: &[Token]) -> TypeSyntax {
             modes,
         };
     }
-    if tokens.first().is_some_and(|token| token.kind == TokenKind::LeftParen)
-        && tokens.last().is_some_and(|token| token.kind == TokenKind::RightParen)
+    if tokens
+        .first()
+        .is_some_and(|token| token.kind == TokenKind::LeftParen)
+        && tokens
+            .last()
+            .is_some_and(|token| token.kind == TokenKind::RightParen)
     {
         let mut members = Vec::new();
         for part in split_top_level(&tokens[1..tokens.len() - 1], TokenKind::Comma) {
@@ -352,9 +494,7 @@ fn parse_type_syntax(tokens: &[Token]) -> TypeSyntax {
             modes,
         };
     }
-    if let Some(range) = tokens
-        .iter()
-        .position(|token| token.kind == TokenKind::DotDot)
+    if let Some(range) = top_level_position(tokens, TokenKind::DotDot)
         && let (Some(lower), Some(upper)) = (
             expression_syntax(&tokens[..range]),
             expression_syntax(&tokens[range + 1..]),
@@ -487,14 +627,27 @@ fn parse_type_syntax(tokens: &[Token]) -> TypeSyntax {
         } else {
             after_keyword
         };
-        let mut scanner = DeclarationScanner::new(&tokens[member_start..end], false, true);
+        let member_tokens = &tokens[member_start..end];
+        let variant_start = matches!(
+            kind,
+            AggregateSyntaxKind::Record | AggregateSyntaxKind::PackedRecord
+        )
+        .then(|| variant_case_position(member_tokens))
+        .flatten();
+        let ordinary_tokens = variant_start.map_or(member_tokens, |variant_start| {
+            &member_tokens[..variant_start]
+        });
+        let mut scanner = DeclarationScanner::new(ordinary_tokens, false, true);
         let members = scanner.parse_all();
+        let variant = variant_start
+            .and_then(|variant_start| parse_variant_part(&member_tokens[variant_start..]))
+            .map(Box::new);
         return TypeSyntax {
             kind: TypeSyntaxKind::Aggregate {
                 kind,
                 base,
                 members,
-                variant: None,
+                variant,
             },
             span,
             modes,
@@ -554,6 +707,14 @@ fn parse_value_declaration(tokens: &[Token], constant: bool) -> Option<ValueDecl
     if !errors.is_empty() {
         return None;
     }
+    let declaration_end = if tokens
+        .last()
+        .is_some_and(|token| token.kind == TokenKind::Semicolon)
+    {
+        tokens.len().saturating_sub(1)
+    } else {
+        tokens.len()
+    };
     let type_end = tokens[separator + 1..]
         .iter()
         .position(|token| {
@@ -567,9 +728,7 @@ fn parse_value_declaration(tokens: &[Token], constant: bool) -> Option<ValueDecl
                 || is_keyword(token, "nodefault")
                 || is_keyword(token, "implements")
         })
-        .map_or(tokens.len().saturating_sub(1), |offset| {
-            separator + 1 + offset
-        });
+        .map_or(declaration_end, |offset| separator + 1 + offset);
     let ty = (tokens[separator].kind == TokenKind::Colon && separator + 1 < type_end)
         .then(|| parse_type_syntax(&tokens[separator + 1..type_end]));
     let initializer_start = if tokens[separator].kind == TokenKind::Equal {
@@ -577,9 +736,7 @@ fn parse_value_declaration(tokens: &[Token], constant: bool) -> Option<ValueDecl
     } else {
         tokens[separator + 1..]
             .iter()
-            .position(|token| {
-                token.kind == TokenKind::Equal || token.kind == TokenKind::Assign
-            })
+            .position(|token| token.kind == TokenKind::Equal || token.kind == TokenKind::Assign)
             .map(|offset| separator + offset + 2)
     };
     let initializer = initializer_start.and_then(|start| {
@@ -696,11 +853,12 @@ fn parse_formal_parameter(tokens: &[Token]) -> Option<FormalParameterSyntax> {
         let type_end = equal.unwrap_or(tokens.len());
         (colon + 1 < type_end).then(|| parse_type_syntax(&tokens[colon + 1..type_end]))
     });
+    let default = equal.and_then(|equal| expression_syntax(&tokens[equal + 1..]));
     Some(FormalParameterSyntax {
         names: names?,
         mode,
         ty,
-        has_default: equal.is_some(),
+        default,
         span: token_span(tokens, tokens.first()?.span.start),
     })
 }
@@ -1042,10 +1200,10 @@ impl<'a> DeclarationScanner<'a> {
             &self.tokens[start..=header_end.min(self.tokens.len() - 1)],
             kind,
         )
-            .unwrap_or_else(|| SpannedName {
-                spelling: "<missing>".to_owned(),
-                span: self.tokens[start].span.clone(),
-            });
+        .unwrap_or_else(|| SpannedName {
+            spelling: "<missing>".to_owned(),
+            span: self.tokens[start].span.clone(),
+        });
         let (parameters, result) =
             routine_signature_syntax(&self.tokens[start..=header_end.min(self.tokens.len() - 1)]);
         self.index = end;
@@ -1116,10 +1274,20 @@ fn count_declarations(declarations: &[DeclarationSyntax]) -> (usize, usize) {
         match declaration {
             DeclarationSyntax::TypeSection { declarations, .. } => {
                 for declaration in declarations {
-                    if let TypeSyntaxKind::Aggregate { members, .. } = &declaration.ty.kind {
+                    if let TypeSyntaxKind::Aggregate {
+                        members, variant, ..
+                    } = &declaration.ty.kind
+                    {
                         let nested = count_declarations(members);
                         total += nested.0;
                         unsupported += nested.1;
+                        if let Some(variant) = variant {
+                            for alternative in &variant.alternatives {
+                                let nested = count_declarations(&alternative.members);
+                                total += nested.0;
+                                unsupported += nested.1;
+                            }
+                        }
                     }
                     if matches!(declaration.ty.kind, TypeSyntaxKind::Unsupported(_)) {
                         unsupported += 1;

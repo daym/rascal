@@ -136,6 +136,7 @@ pub enum BoundExpressionKind {
         target: BoundApplicationTarget,
         callee: Option<Box<BoundExpression>>,
         operands: Vec<BoundExpression>,
+        modes: ModeSnapshot,
     },
     Member {
         base: Box<BoundExpression>,
@@ -146,8 +147,17 @@ pub enum BoundExpressionKind {
         indices: Vec<BoundExpression>,
     },
     Dereference(Box<BoundExpression>),
-    Set(Vec<BoundExpression>),
+    Set(Vec<BoundSetElement>),
     Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BoundSetElement {
+    Value(BoundExpression),
+    Range {
+        low: BoundExpression,
+        high: BoundExpression,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

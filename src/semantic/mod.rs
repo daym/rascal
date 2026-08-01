@@ -1,5 +1,6 @@
 pub mod application;
 pub mod binder;
+pub mod constants;
 pub mod expressions;
 pub mod frontend;
 pub mod ids;
@@ -16,9 +17,13 @@ pub use binder::{
     AggregateDefinition, AggregateKind, BindError, DeclaredRoutine, DeclaredType,
     RoutineBodyCheckpoint, SemanticBinder, UnresolvedTypeForward,
 };
+pub use constants::{
+    ConstantEntry, ConstantEvaluationError, ConstantEvaluator, ConstantRegistry, ConstantValue,
+};
 pub use expressions::{
     BoundApplicationTarget, BoundBody, BoundCaseArm, BoundCaseLabel, BoundExceptionHandler,
-    BoundExpression, BoundExpressionKind, BoundStatement, BoundStatementKind, BoundTryContinuation,
+    BoundExpression, BoundExpressionKind, BoundSetElement, BoundStatement, BoundStatementKind,
+    BoundTryContinuation,
 };
 pub use frontend::{BoundFile, SemanticCompilation, bind_sources};
 pub use ids::{
@@ -35,11 +40,11 @@ pub use scope::{
 };
 pub use types::{
     AccessKind, AggregateShape, AliasType, ArrayType, CallableFlavor, CallableType,
-    CallingConvention, Capture, ClassType, ConversionRank, EnvironmentRequirement,
-    ExplicitConversion, Field, FieldLayout, FormalParameter, IncompleteReason, ObjectType,
-    OpaqueType, PackedRecordType, ParameterMode, PascalType, Place, PointerType, PrimitiveKind,
-    PrimitiveType, RangeCheck, RegularRecordType, RoutineOwner, RoutineSignature, StorageBase,
-    StorageLayout, StringKind, StringType, TypeEntry, TypeOwner, TypeQuery, TypeRegistry,
-    TypeRegistryError, TypeState, ValueConversion, ValueConversionOperation, VariantAlternative,
-    VariantPart,
+    CallingConvention, Capture, ClassType, ConversionRank, EnumMember, EnumType,
+    EnvironmentRequirement, ExplicitConversion, Field, FieldLayout, FormalParameter,
+    IncompleteReason, ObjectType, OpaqueType, OrdinalDomain, PackedRecordType, ParameterMode,
+    PascalType, Place, PointerType, PrimitiveKind, PrimitiveType, RangeCheck, RegularRecordType,
+    RoutineOwner, RoutineSignature, SetType, StorageBase, StorageLayout, StringKind, StringType,
+    SubrangeType, TypeEntry, TypeOwner, TypeQuery, TypeRegistry, TypeRegistryError, TypeState,
+    UnitType, ValueConversion, ValueConversionOperation, VariantAlternative, VariantPart,
 };

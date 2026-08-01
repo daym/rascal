@@ -46,7 +46,7 @@ pub struct FormalParameterSyntax {
     pub names: Vec<SpannedName>,
     pub mode: FormalModeSyntax,
     pub ty: Option<TypeSyntax>,
-    pub has_default: bool,
+    pub default: Option<Expr>,
     pub span: Span,
 }
 

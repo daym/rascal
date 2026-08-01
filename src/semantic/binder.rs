@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 
 use super::{
-    AggregateShape, CallableFlavor, CallableType, DeclId, DeclarationMode, DeclarationState,
-    DeclareError, EnvironmentCheckpoint, EnvironmentId, EnvironmentRequirement, Field, FieldLayout,
-    FrameKind, IncompleteReason, LookupEdge, LookupRequest, NameId, ObjectType, PackedRecordType,
-    PascalType, PointerType, RegionOwner, RegularRecordType, RoutineOwner, RoutineSignature,
-    ScopeGraph, StorageLayout, SymbolId, SymbolKind, TypeOwner, TypeRef, TypeRegistry,
-    TypeRegistryError, TypeSectionId, VariantPart,
+    AggregateShape, CallableFlavor, CallableType, ConstantRegistry, DeclId, DeclarationMode,
+    DeclarationState, DeclareError, EnvironmentCheckpoint, EnvironmentId, EnvironmentRequirement,
+    Field, FieldLayout, FrameKind, IncompleteReason, LookupEdge, LookupRequest, NameId, ObjectType,
+    PackedRecordType, PascalType, PointerType, RegionOwner, RegularRecordType, RoutineOwner,
+    RoutineSignature, ScopeGraph, StorageLayout, SymbolId, SymbolKind, TypeOwner, TypeRef,
+    TypeRegistry, TypeRegistryError, TypeSectionId, VariantPart,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +96,7 @@ struct ActiveTypeSection {
 pub struct SemanticBinder {
     pub scopes: ScopeGraph,
     pub types: TypeRegistry,
+    pub constants: ConstantRegistry,
     active_type_section: Option<ActiveTypeSection>,
     explicit_type_forwards: BTreeMap<(super::RegionId, NameId), PendingType>,
     next_type_section: usize,
@@ -113,6 +114,7 @@ impl SemanticBinder {
         Self {
             scopes: ScopeGraph::new(),
             types: TypeRegistry::new(),
+            constants: ConstantRegistry::default(),
             active_type_section: None,
             explicit_type_forwards: BTreeMap::new(),
             next_type_section: 0,

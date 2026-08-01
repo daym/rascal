@@ -25,6 +25,10 @@ impl NameInterner {
     pub fn spelling(&self, name: NameId) -> &str {
         &self.names[name.index()]
     }
+
+    pub fn lookup(&self, spelling: &str) -> Option<NameId> {
+        self.ids.get(&spelling.to_ascii_lowercase()).copied()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

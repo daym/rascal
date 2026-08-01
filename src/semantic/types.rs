@@ -1,6 +1,7 @@
 use std::{any::Any, cell::RefCell, collections::BTreeSet, fmt::Debug};
 
 use super::{
+    constants::ConstantValue,
     ids::{DeclId, EnvironmentId, NameId, NodeId, RegionId, StorageId, SymbolId, TypeRef},
     scope::SymbolCategory,
 };
@@ -247,6 +248,7 @@ pub struct TypeEntry {
 pub enum TypeRegistryError {
     AlreadyComplete(TypeRef),
     NotCallable(TypeRef),
+    NotEnumeration(TypeRef),
 }
 
 #[derive(Debug, Default)]
@@ -401,8 +403,7 @@ impl TypeRegistry {
     }
 
     pub fn ordinal_base_type(&self, ty: TypeRef) -> Option<TypeRef> {
-        self.implementation(ty)?
-            .ordinal_base_type(self.query(ty))
+        self.implementation(ty)?.ordinal_base_type(self.query(ty))
     }
 
     pub fn sequence_element_type(&self, ty: TypeRef) -> Option<TypeRef> {
@@ -412,6 +413,24 @@ impl TypeRegistry {
 
     pub fn array_element_type(&self, ty: TypeRef) -> Option<TypeRef> {
         self.implementation(ty)?.array_element_type(self.query(ty))
+    }
+
+    pub fn set_element_type(&self, ty: TypeRef) -> Option<TypeRef> {
+        self.implementation(ty)?
+            .as_any()
+            .downcast_ref::<SetType>()
+            .map(|set| set.element)
+    }
+
+    pub fn variant_part(&self, ty: TypeRef) -> Option<&VariantPart> {
+        let implementation = self.implementation(ty)?;
+        if let Some(record) = implementation.as_any().downcast_ref::<RegularRecordType>() {
+            return record.variant.as_ref();
+        }
+        implementation
+            .as_any()
+            .downcast_ref::<PackedRecordType>()
+            .and_then(|record| record.variant.as_ref())
     }
 
     pub fn sequence_index_type(&self, ty: TypeRef) -> Option<TypeRef> {
@@ -531,6 +550,23 @@ impl TypeRegistry {
             .downcast_ref::<CallableType>()
     }
 
+    pub fn set_enum_members(
+        &mut self,
+        ty: TypeRef,
+        members: Vec<EnumMember>,
+        domain: OrdinalDomain,
+    ) -> Result<(), TypeRegistryError> {
+        let Some(enumeration) = self
+            .implementation_mut(ty)
+            .and_then(|implementation| implementation.as_any_mut().downcast_mut::<EnumType>())
+        else {
+            return Err(TypeRegistryError::NotEnumeration(ty));
+        };
+        enumeration.members = members;
+        enumeration.domain = domain;
+        Ok(())
+    }
+
     fn allocate_entry(
         &mut self,
         owner: TypeOwner,
@@ -600,28 +636,31 @@ impl PascalType for PrimitiveType {
         }
         let source_type = query.types.canonical_type(source);
         let source_implementation = query.types.implementation(source_type)?;
-        if let Some(source) = source_implementation.as_any().downcast_ref::<PrimitiveType>() {
+        if let Some(source) = source_implementation
+            .as_any()
+            .downcast_ref::<PrimitiveType>()
+        {
             return match (self.kind, source.kind) {
-            (
-                PrimitiveKind::Integer {
-                    bits: destination_bits,
-                    signed: destination_signed,
-                },
-                PrimitiveKind::Integer {
-                    bits: source_bits,
-                    signed: source_signed,
-                },
-            ) if destination_bits >= source_bits
-                && (destination_signed == source_signed
-                    || destination_signed && destination_bits > source_bits) =>
-            {
-                Some(ValueConversion {
-                    rank: ConversionRank::Widening,
-                    operation: ValueConversionOperation::IntegerWiden,
-                    range_check: RangeCheck::None,
-                })
-            }
-            _ => None,
+                (
+                    PrimitiveKind::Integer {
+                        bits: destination_bits,
+                        signed: destination_signed,
+                    },
+                    PrimitiveKind::Integer {
+                        bits: source_bits,
+                        signed: source_signed,
+                    },
+                ) if destination_bits >= source_bits
+                    && (destination_signed == source_signed
+                        || destination_signed && destination_bits > source_bits) =>
+                {
+                    Some(ValueConversion {
+                        rank: ConversionRank::Widening,
+                        operation: ValueConversionOperation::IntegerWiden,
+                        range_check: RangeCheck::None,
+                    })
+                }
+                _ => None,
             };
         }
         match self.kind {
@@ -1003,7 +1042,7 @@ pub enum ParameterMode {
 pub struct FormalParameter {
     pub mode: ParameterMode,
     pub ty: TypeRef,
-    pub has_default: bool,
+    pub default: Option<ConstantValue>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1517,7 +1556,7 @@ mod tests {
                     parameters: vec![FormalParameter {
                         mode: ParameterMode::Value,
                         ty: parameter,
-                        has_default: false,
+                        default: None,
                     }],
                     result: None,
                     calling_convention: CallingConvention::Pascal,

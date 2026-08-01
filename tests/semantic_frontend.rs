@@ -300,7 +300,8 @@ fn untyped_storage_and_trailing_defaults_are_part_of_call_viability() {
         .map(|callable| &callable.signature)
         .collect::<Vec<_>>();
     assert!(signatures.iter().any(|signature| {
-        signature.parameters.len() == 1 && signature.parameters[0].has_default
+        signature.parameters.len() == 1
+            && signature.parameters[0].default == Some(rascal::semantic::ConstantValue::Integer(7))
     }));
 }
 

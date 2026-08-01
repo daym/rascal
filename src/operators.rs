@@ -1,0 +1,301 @@
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperatorInvocation {
+    ImplicitConversion,
+    ExplicitConversion,
+    UnaryToken,
+    MutatingUnary,
+    BinaryToken,
+    Lifecycle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperatorSelection {
+    Always,
+    Checked,
+    Unchecked,
+    Logical,
+    Bitwise,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperatorProvenance {
+    Delphi,
+    LegacyFpc,
+    TpccExtension,
+    DelphiLifecycle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OperatorSpec {
+    pub declaration_name: &'static str,
+    pub invocation_spelling: &'static str,
+    pub arity: usize,
+    pub invocation: OperatorInvocation,
+    pub selection: OperatorSelection,
+    pub pascal_identifier: &'static str,
+    pub cxx_name: &'static str,
+    pub comparison: bool,
+    pub provenance: OperatorProvenance,
+    pub declaration_supported: bool,
+}
+
+use OperatorInvocation as I;
+use OperatorProvenance as P;
+use OperatorSelection as S;
+
+pub const OPERATOR_CATALOG: &[OperatorSpec] = &[
+    OperatorSpec::new("implicit", ":implicit", 1, I::ImplicitConversion, S::Checked, "&op_CheckedImplicit", "o_implicit", false, P::Delphi, true),
+    OperatorSpec::new("uncheckedimplicit", ":implicit", 1, I::ImplicitConversion, S::Unchecked, "&op_Implicit", "o_unchecked_implicit", false, P::TpccExtension, true),
+    OperatorSpec::new(":=", ":implicit", 1, I::ImplicitConversion, S::Checked, "&op_CheckedImplicit", "o_implicit", false, P::LegacyFpc, true),
+    OperatorSpec::new(":=", ":implicit", 1, I::ImplicitConversion, S::Unchecked, "&op_Implicit", "o_implicit", false, P::LegacyFpc, true),
+    OperatorSpec::new("explicit", ":explicit", 1, I::ExplicitConversion, S::Always, "&op_Explicit", "o_explicit", false, P::Delphi, true),
+    OperatorSpec::new("negative", "-", 1, I::UnaryToken, S::Checked, "&op_CheckedUnaryNegation", "o_negative", false, P::Delphi, true),
+    OperatorSpec::new("uncheckednegative", "-", 1, I::UnaryToken, S::Unchecked, "&op_UnaryNegation", "o_unchecked_negative", false, P::TpccExtension, true),
+    OperatorSpec::new("-", "-", 1, I::UnaryToken, S::Checked, "&op_CheckedUnaryNegation", "o_operator_minus", false, P::LegacyFpc, true),
+    OperatorSpec::new("-", "-", 1, I::UnaryToken, S::Unchecked, "&op_UnaryNegation", "o_operator_minus", false, P::LegacyFpc, true),
+    OperatorSpec::new("positive", "+", 1, I::UnaryToken, S::Always, "&op_UnaryPlus", "o_positive", false, P::Delphi, true),
+    OperatorSpec::new("+", "+", 1, I::UnaryToken, S::Always, "&op_UnaryPlus", "o_operator_plus", false, P::LegacyFpc, true),
+    OperatorSpec::new("logicalnot", "not", 1, I::UnaryToken, S::Always, "&op_LogicalNot", "o_logicalnot", false, P::Delphi, true),
+    OperatorSpec::new("not", "not", 1, I::UnaryToken, S::Always, "&op_LogicalNot", "o_not", false, P::LegacyFpc, true),
+    OperatorSpec::new("inc", "inc", 1, I::MutatingUnary, S::Checked, "&op_CheckedIncrement", "o_inc", false, P::Delphi, true),
+    OperatorSpec::new("uncheckedinc", "inc", 1, I::MutatingUnary, S::Unchecked, "&op_Increment", "o_unchecked_inc", false, P::TpccExtension, true),
+    OperatorSpec::new("dec", "dec", 1, I::MutatingUnary, S::Checked, "&op_CheckedDecrement", "o_dec", false, P::Delphi, true),
+    OperatorSpec::new("uncheckeddec", "dec", 1, I::MutatingUnary, S::Unchecked, "&op_Decrement", "o_unchecked_dec", false, P::TpccExtension, true),
+    OperatorSpec::new("equal", "=", 2, I::BinaryToken, S::Always, "&op_Equality", "o_equal", true, P::Delphi, true),
+    OperatorSpec::new("=", "=", 2, I::BinaryToken, S::Always, "&op_Equality", "o_operator_equal", true, P::LegacyFpc, true),
+    OperatorSpec::new("notequal", "<>", 2, I::BinaryToken, S::Always, "&op_Inequality", "o_notequal", true, P::Delphi, true),
+    OperatorSpec::new("<>", "<>", 2, I::BinaryToken, S::Always, "&op_Inequality", "o_operator_not_equal", true, P::LegacyFpc, true),
+    OperatorSpec::new("greaterthan", ">", 2, I::BinaryToken, S::Always, "&op_GreaterThan", "o_greaterthan", true, P::Delphi, true),
+    OperatorSpec::new(">", ">", 2, I::BinaryToken, S::Always, "&op_GreaterThan", "o_operator_greater", true, P::LegacyFpc, true),
+    OperatorSpec::new("greaterthanorequal", ">=", 2, I::BinaryToken, S::Always, "&op_GreaterThanOrEqual", "o_greaterthanorequal", true, P::Delphi, true),
+    OperatorSpec::new(">=", ">=", 2, I::BinaryToken, S::Always, "&op_GreaterThanOrEqual", "o_operator_greater_equal", true, P::LegacyFpc, true),
+    OperatorSpec::new("lessthan", "<", 2, I::BinaryToken, S::Always, "&op_LessThan", "o_lessthan", true, P::Delphi, true),
+    OperatorSpec::new("<", "<", 2, I::BinaryToken, S::Always, "&op_LessThan", "o_operator_less", true, P::LegacyFpc, true),
+    OperatorSpec::new("lessthanorequal", "<=", 2, I::BinaryToken, S::Always, "&op_LessThanOrEqual", "o_lessthanorequal", true, P::Delphi, true),
+    OperatorSpec::new("<=", "<=", 2, I::BinaryToken, S::Always, "&op_LessThanOrEqual", "o_operator_less_equal", true, P::LegacyFpc, true),
+    OperatorSpec::new("add", "+", 2, I::BinaryToken, S::Checked, "&op_CheckedAddition", "o_add", false, P::Delphi, true),
+    OperatorSpec::new("uncheckedadd", "+", 2, I::BinaryToken, S::Unchecked, "&op_Addition", "o_unchecked_add", false, P::TpccExtension, true),
+    OperatorSpec::new("+", "+", 2, I::BinaryToken, S::Checked, "&op_CheckedAddition", "o_operator_plus", false, P::LegacyFpc, true),
+    OperatorSpec::new("+", "+", 2, I::BinaryToken, S::Unchecked, "&op_Addition", "o_operator_plus", false, P::LegacyFpc, true),
+    OperatorSpec::new("subtract", "-", 2, I::BinaryToken, S::Checked, "&op_CheckedSubtraction", "o_subtract", false, P::Delphi, true),
+    OperatorSpec::new("uncheckedsubtract", "-", 2, I::BinaryToken, S::Unchecked, "&op_Subtraction", "o_unchecked_subtract", false, P::TpccExtension, true),
+    OperatorSpec::new("-", "-", 2, I::BinaryToken, S::Checked, "&op_CheckedSubtraction", "o_operator_minus", false, P::LegacyFpc, true),
+    OperatorSpec::new("-", "-", 2, I::BinaryToken, S::Unchecked, "&op_Subtraction", "o_operator_minus", false, P::LegacyFpc, true),
+    OperatorSpec::new("multiply", "*", 2, I::BinaryToken, S::Checked, "&op_CheckedMultiply", "o_multiply", false, P::Delphi, true),
+    OperatorSpec::new("uncheckedmultiply", "*", 2, I::BinaryToken, S::Unchecked, "&op_Multiply", "o_unchecked_multiply", false, P::TpccExtension, true),
+    OperatorSpec::new("*", "*", 2, I::BinaryToken, S::Checked, "&op_CheckedMultiply", "o_operator_multiply", false, P::LegacyFpc, true),
+    OperatorSpec::new("*", "*", 2, I::BinaryToken, S::Unchecked, "&op_Multiply", "o_operator_multiply", false, P::LegacyFpc, true),
+    OperatorSpec::new("intdivide", "div", 2, I::BinaryToken, S::Checked, "&op_CheckedIntDivide", "o_intdivide", false, P::Delphi, true),
+    OperatorSpec::new("uncheckedintdivide", "div", 2, I::BinaryToken, S::Unchecked, "&op_IntDivide", "o_unchecked_intdivide", false, P::TpccExtension, true),
+    OperatorSpec::new("div", "div", 2, I::BinaryToken, S::Checked, "&op_CheckedIntDivide", "o_operator_intdivide", false, P::LegacyFpc, true),
+    OperatorSpec::new("div", "div", 2, I::BinaryToken, S::Unchecked, "&op_IntDivide", "o_operator_intdivide", false, P::LegacyFpc, true),
+    OperatorSpec::new("divide", "/", 2, I::BinaryToken, S::Always, "&op_Division", "o_divide", false, P::Delphi, true),
+    OperatorSpec::new("/", "/", 2, I::BinaryToken, S::Always, "&op_Division", "o_operator_divide", false, P::LegacyFpc, true),
+    OperatorSpec::new("modulus", "mod", 2, I::BinaryToken, S::Always, "&op_Modulus", "o_modulus", false, P::Delphi, true),
+    OperatorSpec::new("mod", "mod", 2, I::BinaryToken, S::Always, "&op_Modulus", "o_operator_modulus", false, P::LegacyFpc, true),
+    OperatorSpec::new("leftshift", "shl", 2, I::BinaryToken, S::Always, "&op_LeftShift", "o_leftshift", false, P::Delphi, true),
+    OperatorSpec::new("shl", "shl", 2, I::BinaryToken, S::Always, "&op_LeftShift", "o_shl", false, P::LegacyFpc, true),
+    OperatorSpec::new("rightshift", "shr", 2, I::BinaryToken, S::Always, "&op_RightShift", "o_rightshift", false, P::Delphi, true),
+    OperatorSpec::new("shr", "shr", 2, I::BinaryToken, S::Always, "&op_RightShift", "o_shr", false, P::LegacyFpc, true),
+    OperatorSpec::new("**", "**", 2, I::BinaryToken, S::Always, "&op_Exponentiation", "o_operator_power", false, P::LegacyFpc, true),
+    OperatorSpec::new("><", "><", 2, I::BinaryToken, S::Always, "&op_SymmetricDifference", "o_operator_symmetric_difference", false, P::LegacyFpc, true),
+    OperatorSpec::new("logicaland", "and", 2, I::BinaryToken, S::Logical, "&op_LogicalAnd", "o_logicaland", false, P::Delphi, true),
+    OperatorSpec::new("bitwiseand", "and", 2, I::BinaryToken, S::Bitwise, "&op_BitwiseAnd", "o_bitwiseand", false, P::Delphi, true),
+    OperatorSpec::new("and", "and", 2, I::BinaryToken, S::Logical, "&op_LogicalAnd", "o_and", false, P::LegacyFpc, true),
+    OperatorSpec::new("and", "and", 2, I::BinaryToken, S::Bitwise, "&op_BitwiseAnd", "o_and", false, P::LegacyFpc, true),
+    OperatorSpec::new("logicalor", "or", 2, I::BinaryToken, S::Logical, "&op_LogicalOr", "o_logicalor", false, P::Delphi, true),
+    OperatorSpec::new("bitwiseor", "or", 2, I::BinaryToken, S::Bitwise, "&op_BitwiseOr", "o_bitwiseor", false, P::Delphi, true),
+    OperatorSpec::new("or", "or", 2, I::BinaryToken, S::Logical, "&op_LogicalOr", "o_or", false, P::LegacyFpc, true),
+    OperatorSpec::new("or", "or", 2, I::BinaryToken, S::Bitwise, "&op_BitwiseOr", "o_or", false, P::LegacyFpc, true),
+    OperatorSpec::new("logicalxor", "xor", 2, I::BinaryToken, S::Logical, "&op_LogicalXor", "o_logicalxor", false, P::Delphi, true),
+    OperatorSpec::new("bitwisexor", "xor", 2, I::BinaryToken, S::Bitwise, "&op_BitwiseXor", "o_bitwisexor", false, P::Delphi, true),
+    OperatorSpec::new("xor", "xor", 2, I::BinaryToken, S::Logical, "&op_LogicalXor", "o_xor", false, P::LegacyFpc, true),
+    OperatorSpec::new("xor", "xor", 2, I::BinaryToken, S::Bitwise, "&op_BitwiseXor", "o_xor", false, P::LegacyFpc, true),
+    OperatorSpec::new("in", "in", 2, I::BinaryToken, S::Always, "&op_In", "o_in", true, P::Delphi, true),
+    OperatorSpec::new("initialize", ":initialize", 1, I::Lifecycle, S::Always, "&op_Initialize", "o_initialize", false, P::DelphiLifecycle, false),
+    OperatorSpec::new("finalize", ":finalize", 1, I::Lifecycle, S::Always, "&op_Finalize", "o_finalize", false, P::DelphiLifecycle, false),
+    OperatorSpec::new("assign", ":assign", 2, I::Lifecycle, S::Always, "&op_Assign", "o_assign", false, P::DelphiLifecycle, false),
+];
+
+impl OperatorSpec {
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        declaration_name: &'static str,
+        invocation_spelling: &'static str,
+        arity: usize,
+        invocation: OperatorInvocation,
+        selection: OperatorSelection,
+        pascal_identifier: &'static str,
+        cxx_name: &'static str,
+        comparison: bool,
+        provenance: OperatorProvenance,
+        declaration_supported: bool,
+    ) -> Self {
+        Self {
+            declaration_name,
+            invocation_spelling,
+            arity,
+            invocation,
+            selection,
+            pascal_identifier,
+            cxx_name,
+            comparison,
+            provenance,
+            declaration_supported,
+        }
+    }
+}
+
+pub fn operator_declaration_specs(
+    declaration_name: &str,
+    arity: usize,
+) -> impl Iterator<Item = &'static OperatorSpec> {
+    OPERATOR_CATALOG.iter().filter(move |spec| {
+        spec.declaration_supported
+            && spec.declaration_name.eq_ignore_ascii_case(declaration_name)
+            && spec.arity == arity
+    })
+}
+
+pub fn operator_declaration_spec(
+    declaration_name: &str,
+    arity: usize,
+    checks_enabled: bool,
+    logical_operands: bool,
+) -> Option<&'static OperatorSpec> {
+    let candidates = operator_declaration_specs(declaration_name, arity).collect::<Vec<_>>();
+    let family = candidates
+        .iter()
+        .copied()
+        .filter(|spec| family_matches(spec.selection, logical_operands))
+        .collect::<Vec<_>>();
+    match family.as_slice() {
+        [] => None,
+        [spec] => Some(*spec),
+        _ => unique_spec(
+            family
+                .into_iter()
+                .filter(|spec| selection_matches(spec.selection, checks_enabled, logical_operands)),
+        ),
+    }
+}
+
+pub fn operator_invocation_identifier(
+    invocation: OperatorInvocation,
+    spelling: &str,
+    arity: usize,
+    checks_enabled: bool,
+    logical_operands: bool,
+) -> Option<&'static str> {
+    unique_spec(OPERATOR_CATALOG.iter().filter(|spec| {
+        spec.declaration_supported
+            && spec.invocation == invocation
+            && spec.invocation_spelling == spelling
+            && spec.arity == arity
+            && selection_matches(spec.selection, checks_enabled, logical_operands)
+    }))
+    .map(|spec| spec.pascal_identifier)
+}
+
+pub fn implicit_operator_identifier(range_checks: bool) -> &'static str {
+    operator_invocation_identifier(
+        OperatorInvocation::ImplicitConversion,
+        ":implicit",
+        1,
+        range_checks,
+        false,
+    )
+    .expect("implicit conversion catalog is complete")
+}
+
+pub fn explicit_operator_identifier() -> &'static str {
+    operator_invocation_identifier(
+        OperatorInvocation::ExplicitConversion,
+        ":explicit",
+        1,
+        true,
+        false,
+    )
+    .expect("explicit conversion catalog is complete")
+}
+
+fn unique_spec(
+    specs: impl IntoIterator<Item = &'static OperatorSpec>,
+) -> Option<&'static OperatorSpec> {
+    let mut specs = specs.into_iter();
+    let first = specs.next()?;
+    debug_assert!(specs.all(|spec| spec.pascal_identifier == first.pascal_identifier));
+    Some(first)
+}
+
+const fn family_matches(selection: OperatorSelection, logical_operands: bool) -> bool {
+    match selection {
+        OperatorSelection::Logical => logical_operands,
+        OperatorSelection::Bitwise => !logical_operands,
+        OperatorSelection::Always
+        | OperatorSelection::Checked
+        | OperatorSelection::Unchecked => true,
+    }
+}
+
+const fn selection_matches(
+    selection: OperatorSelection,
+    checks_enabled: bool,
+    logical_operands: bool,
+) -> bool {
+    match selection {
+        OperatorSelection::Always => true,
+        OperatorSelection::Checked => checks_enabled,
+        OperatorSelection::Unchecked => !checks_enabled,
+        OperatorSelection::Logical => logical_operands,
+        OperatorSelection::Bitwise => !logical_operands,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invocation_identity_depends_on_mode_arity_and_operand_family() {
+        assert_eq!(
+            operator_invocation_identifier(I::BinaryToken, "+", 2, true, false),
+            Some("&op_CheckedAddition")
+        );
+        assert_eq!(
+            operator_invocation_identifier(I::BinaryToken, "+", 2, false, false),
+            Some("&op_Addition")
+        );
+        assert_eq!(
+            operator_invocation_identifier(I::UnaryToken, "+", 1, false, false),
+            Some("&op_UnaryPlus")
+        );
+        assert_eq!(
+            operator_invocation_identifier(I::BinaryToken, "and", 2, false, true),
+            Some("&op_LogicalAnd")
+        );
+        assert_eq!(
+            operator_invocation_identifier(I::BinaryToken, "and", 2, false, false),
+            Some("&op_BitwiseAnd")
+        );
+    }
+
+    #[test]
+    fn delphi_and_legacy_declarations_select_the_same_canonical_identifier() {
+        assert_eq!(
+            operator_declaration_spec("Add", 2, true, false)
+                .map(|spec| spec.pascal_identifier),
+            Some("&op_CheckedAddition")
+        );
+        assert_eq!(
+            operator_declaration_spec("+", 2, true, false)
+                .map(|spec| spec.pascal_identifier),
+            Some("&op_CheckedAddition")
+        );
+        assert_eq!(
+            operator_declaration_spec("+", 2, false, false)
+                .map(|spec| spec.pascal_identifier),
+            Some("&op_Addition")
+        );
+    }
+}

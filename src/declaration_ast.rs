@@ -24,6 +24,32 @@ pub enum RoutineSyntaxKind {
     Operator,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormalModeSyntax {
+    Value,
+    Const,
+    Var,
+    Out,
+    ConstRef,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallingConventionSyntax {
+    Pascal,
+    Register,
+    Cdecl,
+    Stdcall,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormalParameterSyntax {
+    pub names: Vec<SpannedName>,
+    pub mode: FormalModeSyntax,
+    pub ty: Option<TypeSyntax>,
+    pub has_default: bool,
+    pub span: Span,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TypeSyntax {
     pub kind: TypeSyntaxKind,
@@ -74,9 +100,14 @@ pub struct ValueDeclarationSyntax {
 pub struct RoutineDeclarationSyntax {
     pub kind: RoutineSyntaxKind,
     pub name: SpannedName,
+    pub parameters: Vec<FormalParameterSyntax>,
+    pub result: Option<TypeSyntax>,
     pub body_declarations: Vec<DeclarationSyntax>,
+    pub body_tokens: Vec<Token>,
     pub has_body: bool,
     pub is_forward: bool,
+    pub overload: bool,
+    pub calling_convention: CallingConventionSyntax,
     pub span: Span,
     pub modes: ModeSnapshot,
 }

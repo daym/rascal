@@ -3,7 +3,8 @@ use chumsky::{error::Rich, extra, prelude::*};
 use crate::{
     CstNode, Diagnostic, PascalFile, PascalSectionKind, Span, Token, TokenKind,
     declaration_ast::{
-        AggregateSyntaxKind, DeclarationParseOutput, DeclarationSyntax, ParsedDeclarationSection,
+        AggregateSyntaxKind, CallingConventionSyntax, DeclarationParseOutput, DeclarationSyntax,
+        FormalModeSyntax, FormalParameterSyntax, ParsedDeclarationSection,
         RoutineDeclarationSyntax, RoutineSyntaxKind, SpannedName, TypeDeclarationSyntax,
         TypeSyntax, TypeSyntaxKind, ValueDeclarationSyntax,
     },
@@ -72,6 +73,13 @@ fn flatten_range(file: &PascalFile, range: std::ops::Range<usize>) -> Vec<Token>
         flatten_node(node, &mut tokens);
     }
     tokens
+}
+
+pub fn section_tokens(file: &PascalFile, kind: PascalSectionKind) -> Option<Vec<Token>> {
+    file.sections
+        .iter()
+        .find(|section| section.kind == kind)
+        .map(|section| flatten_range(file, section.nodes.clone()))
 }
 
 fn opens_aggregate(tokens: &[Token], index: usize) -> bool {
@@ -494,6 +502,119 @@ fn routine_name(tokens: &[Token]) -> Option<SpannedName> {
     })
 }
 
+fn formal_mode(token: &Token) -> Option<FormalModeSyntax> {
+    [
+        ("const", FormalModeSyntax::Const),
+        ("var", FormalModeSyntax::Var),
+        ("out", FormalModeSyntax::Out),
+        ("constref", FormalModeSyntax::ConstRef),
+    ]
+    .into_iter()
+    .find_map(|(word, mode)| is_keyword(token, word).then_some(mode))
+}
+
+fn parse_formal_parameter(tokens: &[Token]) -> Option<FormalParameterSyntax> {
+    let (mode, tokens) = tokens
+        .first()
+        .and_then(formal_mode)
+        .map_or((FormalModeSyntax::Value, tokens), |mode| {
+            (mode, &tokens[1..])
+        });
+    let colon = tokens
+        .iter()
+        .position(|token| token.kind == TokenKind::Colon);
+    let equal = tokens
+        .iter()
+        .position(|token| token.kind == TokenKind::Equal);
+    let names_end = colon.or(equal).unwrap_or(tokens.len());
+    let names_parser = identifier()
+        .separated_by(symbol(TokenKind::Comma))
+        .at_least(1)
+        .collect::<Vec<_>>();
+    let (names, errors) = parse_with(names_parser, &tokens[..names_end]);
+    if !errors.is_empty() {
+        return None;
+    }
+    let ty = colon.and_then(|colon| {
+        let type_end = equal.unwrap_or(tokens.len());
+        (colon + 1 < type_end).then(|| parse_type_syntax(&tokens[colon + 1..type_end]))
+    });
+    Some(FormalParameterSyntax {
+        names: names?,
+        mode,
+        ty,
+        has_default: equal.is_some(),
+        span: token_span(tokens, tokens.first()?.span.start),
+    })
+}
+
+fn routine_signature_syntax(tokens: &[Token]) -> (Vec<FormalParameterSyntax>, Option<TypeSyntax>) {
+    let header_end = first_semicolon(tokens, 0).min(tokens.len());
+    let open = tokens[..header_end]
+        .iter()
+        .position(|token| token.kind == TokenKind::LeftParen);
+    let close = open.and_then(|open| {
+        let mut depth = 0usize;
+        for (index, token) in tokens.iter().enumerate().take(header_end).skip(open) {
+            match token.kind {
+                TokenKind::LeftParen => depth += 1,
+                TokenKind::RightParen => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    });
+    let mut parameters = Vec::new();
+    if let (Some(open), Some(close)) = (open, close) {
+        let mut start = open + 1;
+        let mut depth = 0usize;
+        for index in open + 1..=close {
+            match tokens[index].kind {
+                TokenKind::LeftParen | TokenKind::LeftBracket => depth += 1,
+                TokenKind::RightParen | TokenKind::RightBracket if depth > 0 => depth -= 1,
+                TokenKind::Semicolon if depth == 0 => {
+                    if let Some(parameter) = parse_formal_parameter(&tokens[start..index]) {
+                        parameters.push(parameter);
+                    }
+                    start = index + 1;
+                }
+                TokenKind::RightParen if depth == 0 => {
+                    if start < index
+                        && let Some(parameter) = parse_formal_parameter(&tokens[start..index])
+                    {
+                        parameters.push(parameter);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let result_start = close.map_or_else(
+        || {
+            tokens[1..header_end]
+                .iter()
+                .position(|token| token.kind == TokenKind::Colon)
+                .map(|offset| offset + 2)
+        },
+        |close| {
+            tokens[close + 1..header_end]
+                .iter()
+                .position(|token| token.kind == TokenKind::Colon)
+                .map(|offset| close + offset + 2)
+        },
+    );
+    let result = result_start
+        .filter(|start| *start < header_end)
+        .map(|start| parse_type_syntax(&tokens[start..header_end]));
+    (parameters, result)
+}
+
 fn is_declaration_start(token: &Token) -> bool {
     matches!(
         &token.kind,
@@ -711,19 +832,35 @@ impl<'a> DeclarationScanner<'a> {
         let header_end = first_semicolon(self.tokens, start);
         let mut cursor = (header_end + 1).min(self.tokens.len());
         let mut is_forward = false;
+        let mut overload = kind == RoutineSyntaxKind::Operator;
+        let mut calling_convention = CallingConventionSyntax::Pascal;
         while cursor < self.tokens.len()
             && [
-                "forward", "external", "overload", "inline", "cdecl", "stdcall",
+                "forward", "external", "overload", "inline", "cdecl", "stdcall", "register",
+                "pascal",
             ]
             .iter()
             .any(|word| is_keyword(&self.tokens[cursor], word))
         {
             is_forward |= is_keyword(&self.tokens[cursor], "forward")
                 || is_keyword(&self.tokens[cursor], "external");
+            overload |= is_keyword(&self.tokens[cursor], "overload");
+            calling_convention = if is_keyword(&self.tokens[cursor], "cdecl") {
+                CallingConventionSyntax::Cdecl
+            } else if is_keyword(&self.tokens[cursor], "stdcall") {
+                CallingConventionSyntax::Stdcall
+            } else if is_keyword(&self.tokens[cursor], "register") {
+                CallingConventionSyntax::Register
+            } else if is_keyword(&self.tokens[cursor], "pascal") {
+                CallingConventionSyntax::Pascal
+            } else {
+                calling_convention
+            };
             cursor = (first_semicolon(self.tokens, cursor) + 1).min(self.tokens.len());
         }
 
         let mut body_declarations = Vec::new();
+        let mut body_tokens = Vec::new();
         let mut has_body = false;
         if self.allow_bodies && !is_forward {
             let mut nested = DeclarationScanner::new(&self.tokens[cursor..], true, false);
@@ -733,7 +870,13 @@ impl<'a> DeclarationScanner<'a> {
             self.unsupported += nested.unsupported;
             cursor += nested_consumed;
             if cursor < self.tokens.len() && is_keyword(&self.tokens[cursor], "begin") {
-                cursor = (matching_routine_end(self.tokens, cursor) + 1).min(self.tokens.len());
+                let body_begin = cursor;
+                let body_end = matching_routine_end(self.tokens, cursor);
+                let final_end = body_end.saturating_sub(1);
+                if body_begin < final_end && final_end <= self.tokens.len() {
+                    body_tokens = self.tokens[body_begin + 1..final_end].to_vec();
+                }
+                cursor = (body_end + 1).min(self.tokens.len());
                 has_body = true;
             }
         }
@@ -743,13 +886,20 @@ impl<'a> DeclarationScanner<'a> {
                 spelling: "<missing>".to_owned(),
                 span: self.tokens[start].span.clone(),
             });
+        let (parameters, result) =
+            routine_signature_syntax(&self.tokens[start..=header_end.min(self.tokens.len() - 1)]);
         self.index = end;
         DeclarationSyntax::Routine(RoutineDeclarationSyntax {
             kind,
             name,
+            parameters,
+            result,
             body_declarations,
+            body_tokens,
             has_body,
             is_forward,
+            overload,
+            calling_convention,
             span: token_span(&self.tokens[start..end], self.tokens[start].span.start),
             modes: self.tokens[start].modes,
         })

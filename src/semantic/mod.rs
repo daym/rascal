@@ -1,4 +1,5 @@
 pub mod binder;
+pub mod expressions;
 pub mod frontend;
 pub mod ids;
 pub mod scope;
@@ -8,6 +9,10 @@ pub mod units;
 pub use binder::{
     AggregateDefinition, AggregateKind, BindError, DeclaredRoutine, DeclaredType,
     RoutineBodyCheckpoint, SemanticBinder, UnresolvedTypeForward,
+};
+pub use expressions::{
+    BoundApplicationTarget, BoundBody, BoundExpression, BoundExpressionKind, BoundStatement,
+    BoundStatementKind,
 };
 pub use frontend::{BoundFile, SemanticCompilation, bind_sources};
 pub use ids::{

@@ -63,6 +63,7 @@ pub enum ValueConversionOperation {
     StringConvert,
     ArrayConvert,
     Callable,
+    UntypedStorage,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -323,6 +324,23 @@ impl TypeRegistry {
             .value_conversion_from(self.query(destination), source)
     }
 
+    pub fn canonical_type(&self, mut ty: TypeRef) -> TypeRef {
+        let mut visited = BTreeSet::new();
+        while visited.insert(ty) {
+            let Some(alias) = self
+                .implementation(ty)
+                .and_then(|implementation| implementation.as_any().downcast_ref::<AliasType>())
+            else {
+                break;
+            };
+            if alias.nominal {
+                break;
+            }
+            ty = alias.target;
+        }
+        ty
+    }
+
     pub fn predefined_explicit_conversion(
         &self,
         destination: TypeRef,
@@ -378,6 +396,13 @@ impl TypeRegistry {
 
     pub fn member_environment(&self, ty: TypeRef) -> Option<EnvironmentId> {
         self.implementation(ty)?.member_environment(self.query(ty))
+    }
+
+    pub fn pointer_target(&self, ty: TypeRef) -> Option<TypeRef> {
+        self.implementation(ty)?
+            .as_any()
+            .downcast_ref::<PointerType>()
+            .map(|pointer| pointer.target)
     }
 
     pub fn project_field(&self, ty: TypeRef, base: Place, name: NameId) -> Option<Place> {
@@ -539,9 +564,10 @@ impl PascalType for PrimitiveType {
         if query.this == source {
             return Some(ValueConversion::identity());
         }
+        let source_type = query.types.canonical_type(source);
         let source = query
             .types
-            .implementation(source)?
+            .implementation(source_type)?
             .as_any()
             .downcast_ref::<PrimitiveType>()?;
         match (self.kind, source.kind) {
@@ -576,9 +602,10 @@ impl PascalType for PrimitiveType {
         if let Some(implicit) = self.value_conversion_from(query, source) {
             return Some(ExplicitConversion::Value(implicit));
         }
+        let source_type = query.types.canonical_type(source);
         let source_type = query
             .types
-            .implementation(source)?
+            .implementation(source_type)?
             .as_any()
             .downcast_ref::<PrimitiveType>()?;
         match (self.kind, source_type.kind) {
@@ -776,6 +803,7 @@ pub enum ParameterMode {
 pub struct FormalParameter {
     pub mode: ParameterMode,
     pub ty: TypeRef,
+    pub has_default: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1289,6 +1317,7 @@ mod tests {
                     parameters: vec![FormalParameter {
                         mode: ParameterMode::Value,
                         ty: parameter,
+                        has_default: false,
                     }],
                     result: None,
                     calling_convention: CallingConvention::Pascal,

@@ -2,6 +2,7 @@
 name = "rascal"
 version = "0.1.0"
 edition = "2024"
+default-run = "rascal"
 
 [dependencies]
 chumsky = { version = "0.13.0", default-features = false, features = ["std", "pratt"] }

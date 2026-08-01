@@ -5,7 +5,7 @@ use std::{
     process::ExitCode,
 };
 
-use rascal::{TokenKind, lex};
+use rascal::{TokenKind, lex, pascal_parser};
 
 fn collect_pascal_files(root: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
     for entry in
@@ -34,9 +34,12 @@ fn line_and_column(source: &str, byte: usize) -> (usize, usize) {
 fn run() -> Result<bool, String> {
     let mut root = PathBuf::from("tests/pascal/generated");
     let mut inventory = false;
+    let mut parse_files = false;
     for argument in env::args().skip(1) {
         if argument == "--inventory" {
             inventory = true;
+        } else if argument == "--parse" {
+            parse_files = true;
         } else {
             root = PathBuf::from(argument);
         }
@@ -51,6 +54,10 @@ fn run() -> Result<bool, String> {
     let mut shown = 0usize;
     let mut spellings = BTreeMap::<String, usize>::new();
     let mut identifiers = BTreeMap::<String, usize>::new();
+    let mut parsed_files = 0usize;
+    let mut parse_diagnostics = 0usize;
+    let mut parse_bad_files = 0usize;
+    let mut parse_shown = 0usize;
     for path in &files {
         let source = fs::read_to_string(path)
             .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
@@ -82,6 +89,24 @@ fn run() -> Result<bool, String> {
             );
             shown += 1;
         }
+        if parse_files {
+            let parsed = pascal_parser::parse(&source);
+            if parsed.file.is_some() {
+                parsed_files += 1;
+            }
+            if !parsed.diagnostics.is_empty() {
+                parse_bad_files += 1;
+            }
+            parse_diagnostics += parsed.diagnostics.len();
+            for diagnostic in parsed.diagnostics {
+                if parse_shown >= 40 {
+                    continue;
+                }
+                let (line, column) = line_and_column(&source, diagnostic.span.start);
+                eprintln!("{}:{line}:{column}: {}", path.display(), diagnostic.message);
+                parse_shown += 1;
+            }
+        }
     }
 
     println!(
@@ -103,7 +128,12 @@ fn run() -> Result<bool, String> {
             println!("{count:>6}  {identifier}");
         }
     }
-    Ok(diagnostic_count == 0)
+    if parse_files {
+        println!(
+            "{parsed_files} files produced CSTs, {parse_diagnostics} structural diagnostics in {parse_bad_files} files"
+        );
+    }
+    Ok(diagnostic_count == 0 && (!parse_files || parsed_files == files.len()))
 }
 
 fn main() -> ExitCode {

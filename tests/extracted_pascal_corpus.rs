@@ -4,7 +4,7 @@ use std::{
     process::Command,
 };
 
-use rascal::lex;
+use rascal::{lex, pascal_parser};
 
 fn collect_pascal_files(root: &Path, output: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(root).unwrap() {
@@ -46,5 +46,39 @@ fn every_extracted_pascal_fixture_lexes_without_errors() {
     assert!(
         failures.is_empty(),
         "extracted fixtures failed to lex: {failures:#?}"
+    );
+}
+
+#[test]
+fn every_extracted_pascal_fixture_produces_a_chumsky_cst() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pascal/generated");
+    let mut files = Vec::new();
+    collect_pascal_files(&root, &mut files);
+    files.sort();
+
+    let mut missing_trees = Vec::new();
+    let mut unexpected_diagnostics = Vec::new();
+    let mut expected_recovery_diagnostics = 0usize;
+    for path in files {
+        let source = fs::read_to_string(&path).unwrap();
+        let output = pascal_parser::parse(&source);
+        if output.file.is_none() {
+            missing_trees.push(path.clone());
+        }
+        if path.ends_with("test_parser/error_recovery_basic.pp") {
+            expected_recovery_diagnostics += output.diagnostics.len();
+        } else if !output.diagnostics.is_empty() {
+            unexpected_diagnostics.push((path, output.diagnostics));
+        }
+    }
+
+    assert!(missing_trees.is_empty(), "missing CSTs: {missing_trees:#?}");
+    assert_eq!(
+        expected_recovery_diagnostics, 1,
+        "the malformed-header recovery fixture should produce one diagnostic"
+    );
+    assert!(
+        unexpected_diagnostics.is_empty(),
+        "unexpected structural diagnostics: {unexpected_diagnostics:#?}"
     );
 }

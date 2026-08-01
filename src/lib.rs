@@ -4,6 +4,7 @@ pub mod lexer;
 pub mod nom_parser;
 pub mod pascal_ast;
 pub mod pascal_parser;
+pub mod semantic;
 
 pub use ast::{
     Application, ApplicationSyntax, Callee, Diagnostic, Expr, ExprKind, Literal, ModeSnapshot,

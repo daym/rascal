@@ -1,65 +1,67 @@
-use super::{EnvironmentId, LookupEdge, NameId, RegionId, RegionOwner, ScopeGraph, UnitId};
+use super::{EnvironmentId, LookupEdge, ModuleId, NameId, RegionId, RegionOwner, ScopeGraph};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UnitPhase {
+pub enum ModulePhase {
     Interface,
     Implementation,
 }
 
 #[derive(Clone, Debug)]
-pub struct UnitInfo {
+pub struct ModuleInfo {
     pub name: NameId,
     /// Contains declarations owned by this interface and no import edges.
     pub interface_exports: EnvironmentId,
-    pub interface_uses: Vec<UnitId>,
-    pub implementation_uses: Vec<UnitId>,
+    pub interface_uses: Vec<ModuleId>,
+    pub implementation_uses: Vec<ModuleId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum UnitGraphError {
-    InterfaceCycle { cycle: Vec<UnitId> },
+pub enum ModuleGraphError {
+    InterfaceCycle { cycle: Vec<ModuleId> },
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct UnitRegistry {
-    units: Vec<UnitInfo>,
+pub struct ModuleRegistry {
+    modules: Vec<ModuleInfo>,
 }
 
-impl UnitRegistry {
+impl ModuleRegistry {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn add_unit(&mut self, name: NameId, interface_exports: EnvironmentId) -> UnitId {
-        let unit = UnitId::from_index(self.units.len());
-        self.units.push(UnitInfo {
+    pub fn add_module(&mut self, name: NameId, interface_exports: EnvironmentId) -> ModuleId {
+        let module = ModuleId::from_index(self.modules.len());
+        self.modules.push(ModuleInfo {
             name,
             interface_exports,
             interface_uses: Vec::new(),
             implementation_uses: Vec::new(),
         });
-        unit
+        module
     }
 
-    pub fn unit(&self, unit: UnitId) -> &UnitInfo {
-        &self.units[unit.index()]
+    pub fn module(&self, module: ModuleId) -> &ModuleInfo {
+        &self.modules[module.index()]
     }
 
-    pub fn set_interface_exports(&mut self, unit: UnitId, exports: EnvironmentId) {
-        self.units[unit.index()].interface_exports = exports;
+    pub fn set_interface_exports(&mut self, module: ModuleId, exports: EnvironmentId) {
+        self.modules[module.index()].interface_exports = exports;
     }
 
-    pub fn set_uses(&mut self, unit: UnitId, phase: UnitPhase, uses: Vec<UnitId>) {
+    pub fn set_uses(&mut self, module: ModuleId, phase: ModulePhase, uses: Vec<ModuleId>) {
         match phase {
-            UnitPhase::Interface => self.units[unit.index()].interface_uses = uses,
-            UnitPhase::Implementation => self.units[unit.index()].implementation_uses = uses,
+            ModulePhase::Interface => self.modules[module.index()].interface_uses = uses,
+            ModulePhase::Implementation => {
+                self.modules[module.index()].implementation_uses = uses;
+            }
         }
     }
 
     /// Returns an order in which every imported interface precedes its user.
     /// Implementation dependencies do not participate, so implementation
     /// cycles remain legal once the interfaces are complete.
-    pub fn interface_order(&self) -> Result<Vec<UnitId>, UnitGraphError> {
+    pub fn interface_order(&self) -> Result<Vec<ModuleId>, ModuleGraphError> {
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum Mark {
             Unvisited,
@@ -68,44 +70,44 @@ impl UnitRegistry {
         }
 
         fn visit(
-            registry: &UnitRegistry,
-            unit: UnitId,
+            registry: &ModuleRegistry,
+            module: ModuleId,
             marks: &mut [Mark],
-            stack: &mut Vec<UnitId>,
-            order: &mut Vec<UnitId>,
-        ) -> Result<(), UnitGraphError> {
-            match marks[unit.index()] {
+            stack: &mut Vec<ModuleId>,
+            order: &mut Vec<ModuleId>,
+        ) -> Result<(), ModuleGraphError> {
+            match marks[module.index()] {
                 Mark::Complete => return Ok(()),
                 Mark::Visiting => {
                     let start = stack
                         .iter()
-                        .position(|candidate| *candidate == unit)
+                        .position(|candidate| *candidate == module)
                         .unwrap_or(0);
                     let mut cycle = stack[start..].to_vec();
-                    cycle.push(unit);
-                    return Err(UnitGraphError::InterfaceCycle { cycle });
+                    cycle.push(module);
+                    return Err(ModuleGraphError::InterfaceCycle { cycle });
                 }
                 Mark::Unvisited => {}
             }
 
-            marks[unit.index()] = Mark::Visiting;
-            stack.push(unit);
-            for dependency in &registry.unit(unit).interface_uses {
+            marks[module.index()] = Mark::Visiting;
+            stack.push(module);
+            for dependency in &registry.module(module).interface_uses {
                 visit(registry, *dependency, marks, stack, order)?;
             }
             stack.pop();
-            marks[unit.index()] = Mark::Complete;
-            order.push(unit);
+            marks[module.index()] = Mark::Complete;
+            order.push(module);
             Ok(())
         }
 
-        let mut marks = vec![Mark::Unvisited; self.units.len()];
+        let mut marks = vec![Mark::Unvisited; self.modules.len()];
         let mut stack = Vec::new();
-        let mut order = Vec::with_capacity(self.units.len());
-        for index in 0..self.units.len() {
+        let mut order = Vec::with_capacity(self.modules.len());
+        for index in 0..self.modules.len() {
             visit(
                 self,
-                UnitId::from_index(index),
+                ModuleId::from_index(index),
                 &mut marks,
                 &mut stack,
                 &mut order,
@@ -117,13 +119,13 @@ impl UnitRegistry {
     pub fn interface_lookup_environment(
         &self,
         scopes: &mut ScopeGraph,
-        unit: UnitId,
+        module: ModuleId,
         local_exports: EnvironmentId,
-        system_exports: Option<(UnitId, EnvironmentId)>,
+        system_exports: Option<(ModuleId, EnvironmentId)>,
     ) -> EnvironmentId {
         let region = scopes.environment_region(local_exports);
         let mut layers = vec![LookupEdge::lexical_parent(local_exports)];
-        layers.extend(self.import_edges(&self.unit(unit).interface_uses));
+        layers.extend(self.import_edges(&self.module(module).interface_uses));
         if let Some((system, exports)) = system_exports {
             layers.push(LookupEdge::system(exports, system));
         }
@@ -133,11 +135,11 @@ impl UnitRegistry {
     pub fn implementation_lookup_environment(
         &self,
         scopes: &mut ScopeGraph,
-        unit: UnitId,
+        module: ModuleId,
         implementation_locals: EnvironmentId,
-        system_exports: Option<(UnitId, EnvironmentId)>,
+        system_exports: Option<(ModuleId, EnvironmentId)>,
     ) -> EnvironmentId {
-        let info = self.unit(unit);
+        let info = self.module(module);
         let region = scopes.environment_region(implementation_locals);
         let mut layers = vec![
             LookupEdge::lexical_parent(implementation_locals),
@@ -153,20 +155,20 @@ impl UnitRegistry {
 
     fn import_edges<'a>(
         &'a self,
-        source_order: &'a [UnitId],
+        source_order: &'a [ModuleId],
     ) -> impl Iterator<Item = LookupEdge> + 'a {
         source_order.iter().rev().map(move |unit| {
-            let exports = self.unit(*unit).interface_exports;
+            let exports = self.module(*unit).interface_exports;
             LookupEdge::import(exports, *unit)
         })
     }
 }
 
-pub fn create_unit_export_environment(
+pub fn create_module_export_environment(
     scopes: &mut ScopeGraph,
-    unit: UnitId,
+    module: ModuleId,
 ) -> (RegionId, EnvironmentId) {
-    scopes.create_detached_region(RegionOwner::Unit(unit), Vec::new())
+    scopes.create_detached_region(RegionOwner::Module(module), Vec::new())
 }
 
 #[cfg(test)]

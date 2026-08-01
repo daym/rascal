@@ -830,7 +830,7 @@ pub enum CallableFlavor {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoutineOwner {
-    Unit,
+    Module,
     Type(TypeRef),
     Routine(TypeRef),
 }

@@ -2,9 +2,9 @@ pub mod binder;
 pub mod expressions;
 pub mod frontend;
 pub mod ids;
+pub mod modules;
 pub mod scope;
 pub mod types;
-pub mod units;
 
 pub use binder::{
     AggregateDefinition, AggregateKind, BindError, DeclaredRoutine, DeclaredType,
@@ -16,8 +16,8 @@ pub use expressions::{
 };
 pub use frontend::{BoundFile, SemanticCompilation, bind_sources};
 pub use ids::{
-    DeclId, EnvironmentId, NameId, NodeId, ReceiverId, RegionId, StorageId, SymbolId, TypeRef,
-    TypeSectionId, UnitId,
+    DeclId, EnvironmentId, ModuleId, NameId, NodeId, ReceiverId, RegionId, StorageId, SymbolId,
+    TypeRef, TypeSectionId,
 };
 pub use scope::{
     DeclarationMode, DeclarationState, DeclareError, EnvironmentCheckpoint, FrameKind,
@@ -34,6 +34,6 @@ pub use types::{
     TypeRegistryError, TypeState, ValueConversion, ValueConversionOperation, VariantAlternative,
     VariantPart,
 };
-pub use units::{
-    UnitGraphError, UnitInfo, UnitPhase, UnitRegistry, create_unit_export_environment,
+pub use modules::{
+    ModuleGraphError, ModuleInfo, ModulePhase, ModuleRegistry, create_module_export_environment,
 };

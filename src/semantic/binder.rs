@@ -259,7 +259,7 @@ impl SemanticBinder {
         mode: DeclarationMode,
     ) -> Result<DeclaredRoutine, BindError> {
         let (flavor, environment, type_owner) = match owner {
-            RoutineOwner::Unit => (
+            RoutineOwner::Module => (
                 CallableFlavor::Routine,
                 EnvironmentRequirement::None,
                 self.fresh_declaration_owner(),

@@ -31,4 +31,4 @@ semantic_id!(StorageId);
 semantic_id!(SymbolId);
 semantic_id!(TypeRef);
 semantic_id!(TypeSectionId);
-semantic_id!(UnitId);
+semantic_id!(ModuleId);

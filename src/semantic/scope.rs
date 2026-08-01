@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::ids::{
-    EnvironmentId, NameId, ReceiverId, RegionId, SymbolId, TypeRef, TypeSectionId, UnitId,
+    EnvironmentId, ModuleId, NameId, ReceiverId, RegionId, SymbolId, TypeRef, TypeSectionId,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -116,7 +116,7 @@ pub struct Symbol {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegionOwner {
     Root,
-    Unit(UnitId),
+    Module(ModuleId),
     Routine(TypeRef),
     Type(TypeRef),
     Block(u32),
@@ -145,7 +145,7 @@ pub enum LookupEdgeKind {
     InheritedMembers,
     ImplicitSelf,
     WithReceiver,
-    UnitImport,
+    ModuleImport,
     System,
 }
 
@@ -154,7 +154,7 @@ pub struct LookupEdge {
     pub target: EnvironmentId,
     pub kind: LookupEdgeKind,
     pub receiver: Option<ReceiverId>,
-    pub imported_from: Option<UnitId>,
+    pub imported_from: Option<ModuleId>,
 }
 
 impl LookupEdge {
@@ -167,21 +167,21 @@ impl LookupEdge {
         }
     }
 
-    pub const fn import(target: EnvironmentId, unit: UnitId) -> Self {
+    pub const fn import(target: EnvironmentId, module: ModuleId) -> Self {
         Self {
             target,
-            kind: LookupEdgeKind::UnitImport,
+            kind: LookupEdgeKind::ModuleImport,
             receiver: None,
-            imported_from: Some(unit),
+            imported_from: Some(module),
         }
     }
 
-    pub const fn system(target: EnvironmentId, unit: UnitId) -> Self {
+    pub const fn system(target: EnvironmentId, module: ModuleId) -> Self {
         Self {
             target,
             kind: LookupEdgeKind::System,
             receiver: None,
-            imported_from: Some(unit),
+            imported_from: Some(module),
         }
     }
 
@@ -265,7 +265,7 @@ pub struct LookupHit {
     pub symbol: SymbolId,
     pub declaring_environment: EnvironmentId,
     pub receiver: Option<ReceiverId>,
-    pub imported_from: Option<UnitId>,
+    pub imported_from: Option<ModuleId>,
     pub path: Vec<LookupStep>,
 }
 
@@ -303,7 +303,7 @@ struct FoundLayer {
     symbols: Vec<SymbolId>,
     environment: EnvironmentId,
     receiver: Option<ReceiverId>,
-    imported_from: Option<UnitId>,
+    imported_from: Option<ModuleId>,
     path: Vec<LookupStep>,
 }
 
@@ -607,7 +607,7 @@ impl ScopeGraph {
         visited: &mut BTreeSet<EnvironmentId>,
         path: Vec<LookupStep>,
         receiver: Option<ReceiverId>,
-        imported_from: Option<UnitId>,
+        imported_from: Option<ModuleId>,
         output: &mut Vec<FoundLayer>,
     ) {
         if !visited.insert(environment) {
@@ -712,7 +712,8 @@ mod tests {
         let mut graph = ScopeGraph::new();
         let name = graph.intern_name("X");
 
-        let (_, mut a) = graph.create_detached_region(RegionOwner::Unit(UnitId(0)), Vec::new());
+        let (_, mut a) =
+            graph.create_detached_region(RegionOwner::Module(ModuleId(0)), Vec::new());
         graph.current = a;
         let a_type = graph
             .declare(
@@ -724,7 +725,8 @@ mod tests {
             .unwrap();
         a = graph.current_environment();
 
-        let (_, mut b) = graph.create_detached_region(RegionOwner::Unit(UnitId(1)), Vec::new());
+        let (_, mut b) =
+            graph.create_detached_region(RegionOwner::Module(ModuleId(1)), Vec::new());
         graph.current = b;
         let b_value = graph
             .declare(
@@ -736,11 +738,12 @@ mod tests {
             .unwrap();
         b = graph.current_environment();
 
-        let (_, consumer) = graph.create_detached_region(RegionOwner::Unit(UnitId(2)), Vec::new());
+        let (_, consumer) =
+            graph.create_detached_region(RegionOwner::Module(ModuleId(2)), Vec::new());
         graph.current = consumer;
         graph.push_overlay(vec![
-            LookupEdge::import(b, UnitId(1)),
-            LookupEdge::import(a, UnitId(0)),
+            LookupEdge::import(b, ModuleId(1)),
+            LookupEdge::import(a, ModuleId(0)),
         ]);
         let start = graph.current_environment();
 
@@ -748,13 +751,13 @@ mod tests {
             .lookup_symbol(start, name, LookupRequest::ORDINARY)
             .unwrap();
         assert_eq!(ordinary.primary[0].symbol, b_value);
-        assert_eq!(ordinary.primary[0].imported_from, Some(UnitId(1)));
+        assert_eq!(ordinary.primary[0].imported_from, Some(ModuleId(1)));
 
         let required_type = graph
             .lookup_symbol(start, name, LookupRequest::REQUIRED_TYPE)
             .unwrap();
         assert_eq!(required_type.primary[0].symbol, a_type);
-        assert_eq!(required_type.primary[0].imported_from, Some(UnitId(0)));
+        assert_eq!(required_type.primary[0].imported_from, Some(ModuleId(0)));
     }
 
     #[test]

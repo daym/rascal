@@ -122,3 +122,24 @@ fn case_labels_must_be_constant_nonoverlapping_values_in_the_selector_domain() {
         compilation.diagnostics
     );
 }
+
+#[test]
+fn typed_constant_conversion_uses_the_declaration_range_mode_snapshot() {
+    let source = "
+        program Main;
+        const
+          {$R+}
+          TooLarge: Byte = 256;
+        begin
+        end.
+    ";
+    let compilation = bind_sources(&[("main.pp", source)]);
+    assert!(
+        compilation
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("OutsideOrdinalDomain")),
+        "{:#?}",
+        compilation.diagnostics
+    );
+}

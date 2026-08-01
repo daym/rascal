@@ -564,7 +564,11 @@ impl CompilationDriver {
         let mut previous = None;
         for syntax in syntax_members {
             let value = if let Some(expression) = &syntax.value {
-                let Some(entry) = self.evaluate_constant_expression(expression, None) else {
+                let Some(entry) = self.evaluate_constant_expression_with_modes(
+                    expression,
+                    None,
+                    declaration.ty.modes,
+                ) else {
                     continue;
                 };
                 let Some(value) = entry.value.ordinal() else {
@@ -632,11 +636,17 @@ impl CompilationDriver {
         upper: &Expr,
         declaration: &TypeDeclarationSyntax,
     ) {
-        let Some(lower) = self.evaluate_constant_expression(lower, None) else {
+        let Some(lower) =
+            self.evaluate_constant_expression_with_modes(lower, None, declaration.ty.modes)
+        else {
             self.define_error_type(name, declaration.span.clone());
             return;
         };
-        let Some(upper) = self.evaluate_constant_expression(upper, Some(lower.ty)) else {
+        let Some(upper) = self.evaluate_constant_expression_with_modes(
+            upper,
+            Some(lower.ty),
+            declaration.ty.modes,
+        ) else {
             self.define_error_type(name, declaration.span.clone());
             return;
         };
@@ -818,8 +828,11 @@ impl CompilationDriver {
         for alternative in &syntax.alternatives {
             let mut labels = Vec::new();
             for label in &alternative.labels {
-                let Some(entry) = self.evaluate_constant_expression(label, Some(selector_type))
-                else {
+                let Some(entry) = self.evaluate_constant_expression_with_modes(
+                    label,
+                    Some(selector_type),
+                    syntax.selector_type.modes,
+                ) else {
                     continue;
                 };
                 let Some(value) = entry.value.ordinal() else {
@@ -939,7 +952,7 @@ impl CompilationDriver {
         let constant_entry = if constant {
             initializer.as_ref().and_then(|initializer| {
                 let evaluator = ConstantEvaluator::new(&self.binder.constants, &self.binder.types);
-                match evaluator.evaluate(initializer, explicit_type) {
+                match evaluator.evaluate_with_modes(initializer, explicit_type, declaration.modes) {
                     Ok(entry) => Some(entry),
                     Err(error) => {
                         self.diagnostics.push(Diagnostic::new(
@@ -1005,14 +1018,15 @@ impl CompilationDriver {
         }
     }
 
-    fn evaluate_constant_expression(
+    fn evaluate_constant_expression_with_modes(
         &mut self,
         expression: &Expr,
         expected: Option<TypeRef>,
+        modes: crate::ModeSnapshot,
     ) -> Option<ConstantEntry> {
         let bound = self.bind_expression(expression, None);
         let evaluator = ConstantEvaluator::new(&self.binder.constants, &self.binder.types);
-        match evaluator.evaluate(&bound, expected) {
+        match evaluator.evaluate_with_modes(&bound, expected, modes) {
             Ok(entry) => Some(entry),
             Err(error) => {
                 self.diagnostics.push(Diagnostic::new(
@@ -1234,7 +1248,9 @@ impl CompilationDriver {
             let default = parameter
                 .default
                 .as_ref()
-                .and_then(|default| self.evaluate_constant_expression(default, Some(ty)))
+                .and_then(|default| {
+                    self.evaluate_constant_expression_with_modes(default, Some(ty), parameter.modes)
+                })
                 .map(|entry| entry.value);
             for name in &parameter.names {
                 let name = self.binder.scopes.intern_name(&name.spelling);
@@ -1283,7 +1299,9 @@ impl CompilationDriver {
             let default = parameter
                 .default
                 .as_ref()
-                .and_then(|default| self.evaluate_constant_expression(default, Some(ty)))
+                .and_then(|default| {
+                    self.evaluate_constant_expression_with_modes(default, Some(ty), parameter.modes)
+                })
                 .map(|entry| entry.value);
             for _ in &parameter.names {
                 formals.push(FormalParameter {
@@ -2393,11 +2411,27 @@ impl CompilationDriver {
             .iter()
             .map(|operand| ActualArgument {
                 ty: operand.ty,
-                addressable: is_addressable(operand),
+                addressable: self.is_addressable(operand),
             })
             .collect::<Vec<_>>();
         ApplicationResolver::new(&self.binder.types, self.builtins.untyped_parameter)
             .resolve(candidates, &actuals)
+    }
+
+    fn is_addressable(&self, expression: &BoundExpression) -> bool {
+        match &expression.kind {
+            BoundExpressionKind::Symbol { symbol, .. }
+            | BoundExpressionKind::Member { symbol, .. } => matches!(
+                self.binder.scopes.symbol(*symbol).kind,
+                SymbolKind::Variable(_)
+            ),
+            BoundExpressionKind::Index { base, .. } => self.is_addressable(base),
+            BoundExpressionKind::Dereference(_) => true,
+            BoundExpressionKind::Literal(_)
+            | BoundExpressionKind::Application { .. }
+            | BoundExpressionKind::Set(_)
+            | BoundExpressionKind::Error => false,
+        }
     }
 
     fn report_application_resolution(
@@ -2465,7 +2499,7 @@ impl CompilationDriver {
                 let mut previous = None;
                 for member in members {
                     let value = if let Some(value) = &member.value {
-                        self.evaluate_constant_expression(value, None)?
+                        self.evaluate_constant_expression_with_modes(value, None, syntax.modes)?
                             .value
                             .ordinal()?
                     } else {
@@ -2494,8 +2528,13 @@ impl CompilationDriver {
                 }))
             }
             TypeSyntaxKind::Subrange { lower, upper } => {
-                let lower = self.evaluate_constant_expression(lower, None)?;
-                let upper = self.evaluate_constant_expression(upper, Some(lower.ty))?;
+                let lower =
+                    self.evaluate_constant_expression_with_modes(lower, None, syntax.modes)?;
+                let upper = self.evaluate_constant_expression_with_modes(
+                    upper,
+                    Some(lower.ty),
+                    syntax.modes,
+                )?;
                 let lower_value = lower.value.ordinal()?;
                 let upper_value = upper.value.ordinal()?;
                 let base = self.binder.types.ordinal_base_type(lower.ty)?;
@@ -2748,16 +2787,6 @@ fn bound_application_error(
         ty: None,
         span,
     }
-}
-
-fn is_addressable(expression: &BoundExpression) -> bool {
-    matches!(
-        expression.kind,
-        BoundExpressionKind::Symbol { .. }
-            | BoundExpressionKind::Member { .. }
-            | BoundExpressionKind::Index { .. }
-            | BoundExpressionKind::Dereference(_)
-    )
 }
 
 fn strip_compound_body(mut tokens: Vec<Token>) -> Vec<Token> {

@@ -288,3 +288,41 @@ fn method_resolution_retains_a_with_receiver() {
         ApplicationReceiver::Lookup(_)
     ));
 }
+
+#[test]
+fn a_property_is_not_storage_for_a_typed_var_formal() {
+    let source = "
+        program Main;
+        type
+          TThing = class
+            property Value: LongInt read GetValue write SetValue;
+          end;
+        procedure Touch(var Destination: LongInt); forward;
+        var Thing: TThing;
+        begin
+          Touch(Thing.Value);
+        end.
+    ";
+    let compilation = bind_sources(&[("main.pp", source)]);
+    assert!(
+        compilation.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("no viable overload for `touch`")),
+        "{:#?}",
+        compilation.diagnostics
+    );
+    let body = compilation
+        .bodies
+        .iter()
+        .find(|body| body.owner.is_none())
+        .unwrap();
+    let BoundApplicationTarget::Routine { resolution } =
+        expression_target(&body.statements[0].kind)
+    else {
+        panic!("expected routine resolution")
+    };
+    assert!(matches!(
+        resolution.attempts[0].rejections.as_slice(),
+        [CandidateRejection::ArgumentNotAddressable { .. }]
+    ));
+}

@@ -47,6 +47,7 @@ pub struct FormalParameterSyntax {
     pub mode: FormalModeSyntax,
     pub ty: Option<TypeSyntax>,
     pub default: Option<Expr>,
+    pub modes: ModeSnapshot,
     pub span: Span,
 }
 

@@ -859,6 +859,7 @@ fn parse_formal_parameter(tokens: &[Token]) -> Option<FormalParameterSyntax> {
         mode,
         ty,
         default,
+        modes: tokens.first()?.modes,
         span: token_span(tokens, tokens.first()?.span.start),
     })
 }

@@ -77,6 +77,15 @@ impl<'a> ConstantEvaluator<'a> {
         expression: &BoundExpression,
         expected: Option<TypeRef>,
     ) -> Result<ConstantEntry, ConstantEvaluationError> {
+        self.evaluate_with_modes(expression, expected, ModeSnapshot::default())
+    }
+
+    pub fn evaluate_with_modes(
+        &self,
+        expression: &BoundExpression,
+        expected: Option<TypeRef>,
+        declaration_modes: ModeSnapshot,
+    ) -> Result<ConstantEntry, ConstantEvaluationError> {
         match &expression.kind {
             BoundExpressionKind::Literal(literal) => {
                 let ty = expected
@@ -94,7 +103,7 @@ impl<'a> ConstantEvaluator<'a> {
                     Literal::Boolean(value) => ConstantValue::Boolean(*value),
                     Literal::Nil => ConstantValue::Nil,
                 };
-                self.convert(ConstantEntry { ty, value }, ty, ModeSnapshot::default())
+                self.convert(ConstantEntry { ty, value }, ty, declaration_modes)
             }
             BoundExpressionKind::Symbol { symbol, .. } => {
                 let entry = self
@@ -103,7 +112,7 @@ impl<'a> ConstantEvaluator<'a> {
                     .cloned()
                     .ok_or(ConstantEvaluationError::NotConstant)?;
                 if let Some(expected) = expected {
-                    self.convert(entry, expected, ModeSnapshot::default())
+                    self.convert(entry, expected, declaration_modes)
                 } else {
                     Ok(entry)
                 }

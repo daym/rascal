@@ -1,0 +1,3 @@
+program demo;
+begin
+end.

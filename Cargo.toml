@@ -1,0 +1,9 @@
+[package]
+name = "rascal"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chumsky = { version = "0.13.0", default-features = false, features = ["std", "pratt"] }
+logos = "0.16.1"
+nom = "8.0.0"

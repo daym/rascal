@@ -11,6 +11,35 @@ pub struct StorageLayout {
     pub alignment: u32,
 }
 
+#[derive(Clone, Debug)]
+pub struct OpaqueType {
+    pub layout: Option<StorageLayout>,
+    pub reference_type: bool,
+    pub managed_lifetime: bool,
+}
+
+impl PascalType for OpaqueType {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn storage_layout(&self, _query: TypeQuery<'_>) -> Option<StorageLayout> {
+        self.layout
+    }
+
+    fn is_reference_type(&self, _query: TypeQuery<'_>) -> bool {
+        self.reference_type
+    }
+
+    fn has_managed_lifetime(&self, _query: TypeQuery<'_>) -> bool {
+        self.managed_lifetime
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConversionRank {
     Exact,
@@ -657,8 +686,10 @@ impl PascalType for PointerType {
 
 #[derive(Clone, Debug)]
 pub struct ClassType {
+    pub aggregate: Option<AggregateShape>,
     pub base: Option<TypeRef>,
     pub interfaces: Vec<TypeRef>,
+    pub methods: Vec<TypeRef>,
     pub pointer_layout: StorageLayout,
 }
 
@@ -677,6 +708,12 @@ impl PascalType for ClassType {
 
     fn is_reference_type(&self, _query: TypeQuery<'_>) -> bool {
         true
+    }
+
+    fn member_environment(&self, _query: TypeQuery<'_>) -> Option<EnvironmentId> {
+        self.aggregate
+            .as_ref()
+            .map(|aggregate| aggregate.member_environment)
     }
 
     fn is_subtype_of(&self, query: TypeQuery<'_>, target: TypeRef) -> bool {
@@ -1290,8 +1327,10 @@ mod tests {
             None,
             env(),
             ClassType {
+                aggregate: None,
                 base: None,
                 interfaces: Vec::new(),
+                methods: Vec::new(),
                 pointer_layout: StorageLayout {
                     size: 8,
                     alignment: 8,
@@ -1303,8 +1342,10 @@ mod tests {
             None,
             env(),
             ClassType {
+                aggregate: None,
                 base: Some(base),
                 interfaces: Vec::new(),
+                methods: Vec::new(),
                 pointer_layout: StorageLayout {
                     size: 8,
                     alignment: 8,

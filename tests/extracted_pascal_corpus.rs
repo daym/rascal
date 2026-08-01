@@ -4,7 +4,7 @@ use std::{
     process::Command,
 };
 
-use rascal::{lex, pascal_parser};
+use rascal::{declaration_parser, lex, pascal_parser, semantic};
 
 fn collect_pascal_files(root: &Path, output: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(root).unwrap() {
@@ -80,5 +80,40 @@ fn every_extracted_pascal_fixture_produces_a_chumsky_cst() {
     assert!(
         unexpected_diagnostics.is_empty(),
         "unexpected structural diagnostics: {unexpected_diagnostics:#?}"
+    );
+}
+
+#[test]
+fn every_extracted_pascal_fixture_reaches_the_semantic_boundary() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pascal/generated");
+    let mut files = Vec::new();
+    collect_pascal_files(&root, &mut files);
+    files.sort();
+
+    let mut failures = Vec::new();
+    for path in files {
+        let source = fs::read_to_string(&path).unwrap();
+        let parsed = pascal_parser::parse(&source);
+        let Some(file) = parsed.file else {
+            failures.push((path, "missing file CST".to_owned()));
+            continue;
+        };
+        let declarations = declaration_parser::parse_file_declarations(&file);
+        if !declarations.diagnostics.is_empty() {
+            failures.push((
+                path.clone(),
+                format!("declaration diagnostics: {:#?}", declarations.diagnostics),
+            ));
+            continue;
+        }
+        let source_name = path.to_string_lossy();
+        let compilation = semantic::bind_sources(&[(&source_name, &source)]);
+        if compilation.files.len() != 1 {
+            failures.push((path, "semantic binder did not return one file".to_owned()));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "fixtures failed before semantic binding: {failures:#?}"
     );
 }

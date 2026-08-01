@@ -1,5 +1,7 @@
 pub mod ast;
 pub mod chumsky_parser;
+pub mod declaration_ast;
+pub mod declaration_parser;
 pub mod lexer;
 pub mod nom_parser;
 pub mod pascal_ast;

@@ -316,6 +316,17 @@ fn analyze_nodes(nodes: Vec<CstNode>, source_len: usize) -> PascalParseOutput {
                 &["initialization", "finalization", "begin", "end"],
             )
             .unwrap_or(final_end);
+            let tail = crate::declaration_parser::declaration_prefix_source_end(
+                &nodes[implementation + 1..final_end],
+                true,
+            )
+            .and_then(|source_end| {
+                nodes[implementation + 1..final_end]
+                    .iter()
+                    .position(|node| node.span().start >= source_end)
+                    .map(|offset| implementation + 1 + offset)
+            })
+            .unwrap_or(tail);
             sections.push(section(
                 PascalSectionKind::Implementation,
                 &nodes,
@@ -356,10 +367,25 @@ fn analyze_nodes(nodes: Vec<CstNode>, source_len: usize) -> PascalParseOutput {
             }
         }
         PascalFileKind::Program | PascalFileKind::Library | PascalFileKind::BareProgram => {
-            let body_start = if kind == PascalFileKind::BareProgram {
+            let fallback_body_start = if kind == PascalFileKind::BareProgram {
                 0
             } else {
                 find_at_depth_zero(&nodes, header_end, &["begin"]).unwrap_or(final_end)
+            };
+            let body_start = if kind == PascalFileKind::BareProgram {
+                0
+            } else {
+                crate::declaration_parser::declaration_prefix_source_end(
+                    &nodes[header_end..final_end],
+                    true,
+                )
+                .and_then(|source_end| {
+                    nodes[header_end..final_end]
+                        .iter()
+                        .position(|node| node.span().start >= source_end)
+                        .map(|offset| header_end + offset)
+                })
+                .unwrap_or(fallback_body_start)
             };
             if header_end < body_start {
                 sections.push(section(

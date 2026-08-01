@@ -1,4 +1,5 @@
 pub mod binder;
+pub mod frontend;
 pub mod ids;
 pub mod scope;
 pub mod types;
@@ -8,6 +9,7 @@ pub use binder::{
     AggregateDefinition, AggregateKind, BindError, DeclaredRoutine, DeclaredType,
     RoutineBodyCheckpoint, SemanticBinder, UnresolvedTypeForward,
 };
+pub use frontend::{BoundFile, SemanticCompilation, bind_sources};
 pub use ids::{
     DeclId, EnvironmentId, NameId, NodeId, ReceiverId, RegionId, StorageId, SymbolId, TypeRef,
     TypeSectionId, UnitId,
@@ -21,10 +23,11 @@ pub use types::{
     AccessKind, AggregateShape, AliasType, ArrayType, CallableFlavor, CallableType,
     CallingConvention, Capture, ClassType, ConversionRank, EnvironmentRequirement,
     ExplicitConversion, Field, FieldLayout, FormalParameter, IncompleteReason, ObjectType,
-    PackedRecordType, ParameterMode, PascalType, Place, PointerType, PrimitiveKind, PrimitiveType,
-    RangeCheck, RegularRecordType, RoutineOwner, RoutineSignature, StorageBase, StorageLayout,
-    StringKind, StringType, TypeEntry, TypeOwner, TypeQuery, TypeRegistry, TypeRegistryError,
-    TypeState, ValueConversion, ValueConversionOperation, VariantAlternative, VariantPart,
+    OpaqueType, PackedRecordType, ParameterMode, PascalType, Place, PointerType, PrimitiveKind,
+    PrimitiveType, RangeCheck, RegularRecordType, RoutineOwner, RoutineSignature, StorageBase,
+    StorageLayout, StringKind, StringType, TypeEntry, TypeOwner, TypeQuery, TypeRegistry,
+    TypeRegistryError, TypeState, ValueConversion, ValueConversionOperation, VariantAlternative,
+    VariantPart,
 };
 pub use units::{
     UnitGraphError, UnitInfo, UnitPhase, UnitRegistry, create_unit_export_environment,

@@ -1,6 +1,6 @@
 use std::{env, fs, path::PathBuf, process::ExitCode};
 
-use rascal::pascal_parser;
+use rascal::semantic;
 
 fn run() -> Result<bool, String> {
     let mut arguments = env::args().skip(1);
@@ -14,7 +14,8 @@ fn run() -> Result<bool, String> {
     }
     let source = fs::read_to_string(&path)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    let output = pascal_parser::parse(&source);
+    let source_name = path.to_string_lossy();
+    let output = semantic::bind_sources(&[(&source_name, &source)]);
 
     for diagnostic in &output.diagnostics {
         eprintln!(
@@ -25,26 +26,16 @@ fn run() -> Result<bool, String> {
             diagnostic.message
         );
     }
-    let Some(file) = output.file else {
+    let Some(file) = output.files.first() else {
         return Ok(false);
     };
     println!(
-        "{:?} {}: {} CST nodes, {} sections",
+        "{:?} {}: {} declarations ({} retained as unsupported)",
         file.kind,
-        file.name.as_deref().unwrap_or("<anonymous>"),
-        file.nodes.len(),
-        file.sections.len()
+        file.pascal_name.as_deref().unwrap_or("<anonymous>"),
+        file.declaration_count,
+        file.unsupported_declarations,
     );
-    for section in &file.sections {
-        println!(
-            "  {:?}: nodes {}..{}, bytes {}..{}",
-            section.kind,
-            section.nodes.start,
-            section.nodes.end,
-            section.span.start,
-            section.span.end
-        );
-    }
     Ok(output.diagnostics.is_empty())
 }
 

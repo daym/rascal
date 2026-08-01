@@ -43,6 +43,7 @@ pub enum AggregateKind {
     RegularRecord,
     PackedRecord,
     Object { base: Option<TypeRef> },
+    Class { base: Option<TypeRef> },
 }
 
 #[derive(Clone, Debug)]
@@ -53,6 +54,7 @@ pub struct AggregateDefinition {
     pub fields: Vec<Field>,
     pub methods: Vec<TypeRef>,
     member_region: super::RegionId,
+    inherited_environment: Option<EnvironmentId>,
     selected_environment: EnvironmentCheckpoint,
 }
 
@@ -95,6 +97,7 @@ pub struct SemanticBinder {
     pub scopes: ScopeGraph,
     pub types: TypeRegistry,
     active_type_section: Option<ActiveTypeSection>,
+    explicit_type_forwards: BTreeMap<(super::RegionId, NameId), PendingType>,
     next_type_section: usize,
     next_declaration: usize,
 }
@@ -111,6 +114,7 @@ impl SemanticBinder {
             scopes: ScopeGraph::new(),
             types: TypeRegistry::new(),
             active_type_section: None,
+            explicit_type_forwards: BTreeMap::new(),
             next_type_section: 0,
             next_declaration: 0,
         }
@@ -212,6 +216,41 @@ impl SemanticBinder {
         Ok((declared, target))
     }
 
+    pub fn declare_explicit_type_forward(
+        &mut self,
+        name: NameId,
+        reason: IncompleteReason,
+    ) -> Result<DeclaredType, BindError> {
+        let region = self
+            .scopes
+            .environment_region(self.scopes.current_environment());
+        let owner = self.type_owner();
+        let ty = self.types.allocate_incomplete(
+            owner,
+            Some(name),
+            self.scopes.current_environment(),
+            reason,
+        );
+        let symbol = match self.scopes.declare(
+            name,
+            SymbolKind::Type(ty),
+            DeclarationState::Forward,
+            DeclarationMode::Fresh,
+        ) {
+            Ok(symbol) => symbol,
+            Err(error) => {
+                self.types.mark_error(ty);
+                return Err(error.into());
+            }
+        };
+        self.types
+            .set_declared_in(ty, self.scopes.symbol(symbol).declared_in);
+        self.register_type_owner(owner, ty)?;
+        self.explicit_type_forwards
+            .insert((region, name), PendingType { symbol, ty });
+        Ok(DeclaredType { symbol, ty })
+    }
+
     pub fn declare_routine(
         &mut self,
         name: NameId,
@@ -290,11 +329,15 @@ impl SemanticBinder {
             self.begin_named_type_definition(name, IncompleteReason::AggregateDefinition)?;
         let outer_environment = self.scopes.current_environment();
         let mut fallbacks = Vec::new();
-        if let AggregateKind::Object { base: Some(base) } = kind {
+        let mut inherited_environment = None;
+        if let AggregateKind::Object { base: Some(base) }
+        | AggregateKind::Class { base: Some(base) } = kind
+        {
             let inherited = self
                 .types
                 .member_environment(base)
                 .ok_or(BindError::MissingMemberEnvironment(base))?;
+            inherited_environment = Some(inherited);
             fallbacks.push(LookupEdge::inherited_members(inherited));
         }
         fallbacks.push(LookupEdge::lexical_parent(outer_environment));
@@ -309,6 +352,7 @@ impl SemanticBinder {
             fields: Vec::new(),
             methods: Vec::new(),
             member_region,
+            inherited_environment,
             selected_environment,
         })
     }
@@ -352,7 +396,11 @@ impl SemanticBinder {
         aggregate: AggregateDefinition,
         variant: Option<VariantPart>,
     ) -> Result<DeclaredType, BindError> {
-        if matches!(aggregate.kind, AggregateKind::Object { .. }) && variant.is_some() {
+        if matches!(
+            aggregate.kind,
+            AggregateKind::Object { .. } | AggregateKind::Class { .. }
+        ) && variant.is_some()
+        {
             self.types.mark_error(aggregate.declared.ty);
             self.scopes
                 .set_symbol_state(aggregate.declared.symbol, DeclarationState::Error);
@@ -366,8 +414,16 @@ impl SemanticBinder {
                 .environment_region(self.scopes.current_environment()),
             aggregate.member_region
         );
+        let inherited = aggregate
+            .inherited_environment
+            .map(LookupEdge::inherited_members)
+            .into_iter()
+            .collect();
+        let member_environment = self
+            .scopes
+            .create_region_view(aggregate.member_region, inherited);
         let shape = AggregateShape {
-            member_environment: self.scopes.current_environment(),
+            member_environment,
             fields: aggregate.fields,
         };
         let implementation = match aggregate.kind {
@@ -386,6 +442,13 @@ impl SemanticBinder {
                 base,
                 methods: aggregate.methods,
                 layout: aggregate.layout,
+            }),
+            AggregateKind::Class { base } => AggregateImplementation::Class(super::ClassType {
+                aggregate: Some(shape),
+                base,
+                interfaces: Vec::new(),
+                methods: aggregate.methods,
+                pointer_layout: aggregate.layout,
             }),
         };
         let result = implementation.complete(&mut self.types, aggregate.declared.ty);
@@ -490,6 +553,17 @@ impl SemanticBinder {
             });
         }
 
+        let region = self
+            .scopes
+            .environment_region(self.scopes.current_environment());
+        if let Some(pending) = self.explicit_type_forwards.remove(&(region, name)) {
+            self.types.begin_definition(pending.ty)?;
+            return Ok(DeclaredType {
+                symbol: pending.symbol,
+                ty: pending.ty,
+            });
+        }
+
         let owner = self.type_owner();
         let ty = self.types.allocate_incomplete(
             owner,
@@ -547,6 +621,7 @@ enum AggregateImplementation {
     Regular(RegularRecordType),
     Packed(PackedRecordType),
     Object(ObjectType),
+    Class(super::ClassType),
 }
 
 impl AggregateImplementation {
@@ -555,6 +630,7 @@ impl AggregateImplementation {
             Self::Regular(implementation) => types.complete(ty, implementation),
             Self::Packed(implementation) => types.complete(ty, implementation),
             Self::Object(implementation) => types.complete(ty, implementation),
+            Self::Class(implementation) => types.complete(ty, implementation),
         }
     }
 }

@@ -431,6 +431,20 @@ impl ScopeGraph {
         self.allocate_environment(region, FrameKind::LookupOverlay, high_to_low_precedence)
     }
 
+    /// Builds a stable view containing only declarations owned by `region`.
+    /// Its optional fallbacks are explicit, so unit imports and outer lexical
+    /// scopes cannot leak through an exported unit/member environment.
+    pub fn create_region_view(
+        &mut self,
+        region: RegionId,
+        fallbacks: Vec<LookupEdge>,
+    ) -> EnvironmentId {
+        let environment = self.allocate_environment(region, FrameKind::LookupOverlay, fallbacks);
+        self.environments[environment.index()].symbols =
+            self.regions[region.index()].declarations.clone();
+        environment
+    }
+
     pub fn restore_environment(&mut self, checkpoint: EnvironmentCheckpoint) {
         self.current = checkpoint.previous;
     }

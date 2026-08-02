@@ -3,8 +3,8 @@ use std::ops::Range;
 use chumsky::{error::Rich, extra, prelude::*};
 
 use crate::{
-    Diagnostic, ModeSnapshot, Span, Token, TokenKind,
-    lexer::lex,
+    Diagnostic, ModeSnapshot, PreprocessorOptions, Span, Token, TokenKind,
+    lexer::{lex, lex_named},
     pascal_ast::{
         CstNode, Delimiter, PascalFile, PascalFileKind, PascalParseOutput, PascalSection,
         PascalSectionKind,
@@ -454,7 +454,25 @@ pub fn parse_tokens(tokens: &[Token], source_len: usize) -> PascalParseOutput {
 
 pub fn parse(source: &str) -> PascalParseOutput {
     let lexed = lex(source);
-    let mut output = parse_tokens(&lexed.tokens, source.len());
+    let mut output = parse_tokens(&lexed.tokens, lexed.logical_len);
+    output.diagnostics.splice(0..0, lexed.diagnostics);
+    output
+}
+
+pub fn parse_named(source_name: &str, source: &str) -> PascalParseOutput {
+    let lexed = lex_named(source_name, source);
+    let mut output = parse_tokens(&lexed.tokens, lexed.logical_len);
+    output.diagnostics.splice(0..0, lexed.diagnostics);
+    output
+}
+
+pub fn parse_with_options(
+    source_name: &str,
+    source: &str,
+    options: &PreprocessorOptions,
+) -> PascalParseOutput {
+    let lexed = crate::preprocess(source_name, source, options);
+    let mut output = parse_tokens(&lexed.tokens, lexed.logical_len);
     output.diagnostics.splice(0..0, lexed.diagnostics);
     output
 }

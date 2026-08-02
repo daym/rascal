@@ -883,7 +883,7 @@ fn parse_simple_segments(tokens: &[Token], end_of_source: usize) -> ParseOutput 
 
 pub fn parse(source: &str) -> ParseOutput {
     let lexed = lex(source);
-    let mut output = parse_tokens(&lexed.tokens, source.len());
+    let mut output = parse_tokens(&lexed.tokens, lexed.logical_len);
     output.diagnostics.splice(0..0, lexed.diagnostics);
     output
 }

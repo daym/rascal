@@ -1,12 +1,16 @@
 use logos::Logos;
 
-use crate::ast::{Diagnostic, ModeSnapshot, Span};
+use crate::{
+    ast::{Diagnostic, ModeSnapshot, SourceId, SourceSpan, Span},
+    preprocessor::{DirectiveState, DirectiveStateId, PreprocessorOptions, preprocess},
+};
 
 #[derive(Logos, Clone, Debug, PartialEq)]
 #[logos(skip r"[ \t\r\n\f]+")]
-enum RawToken {
-    #[regex(r"\{\$[vVrRqQiIbB][+-]\}", parse_directive, priority = 3)]
-    Directive(ModeDirective),
+pub(crate) enum RawToken {
+    #[regex(r"\{\$[^}]*\}", parse_directive_body, priority = 100)]
+    #[regex(r"\(\*\$[^*]*\*\)", parse_directive_body, priority = 100)]
+    Directive(String),
 
     #[regex(r"\{[^}]*\}", logos::skip, priority = 1)]
     #[regex(r"\(\*([^*]|\*+[^*)])*\*+\)", logos::skip)]
@@ -86,25 +90,20 @@ enum RawToken {
     Greater,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ModeDirective {
-    VarString(bool),
-    Range(bool),
-    Overflow(bool),
-    Io(bool),
-    CompleteBoolean(bool),
-}
-
-fn parse_directive(lex: &mut logos::Lexer<'_, RawToken>) -> ModeDirective {
-    let bytes = lex.slice().as_bytes();
-    let enabled = bytes[3] == b'+';
-    match bytes[2].to_ascii_lowercase() {
-        b'v' => ModeDirective::VarString(enabled),
-        b'r' => ModeDirective::Range(enabled),
-        b'q' => ModeDirective::Overflow(enabled),
-        b'i' => ModeDirective::Io(enabled),
-        b'b' => ModeDirective::CompleteBoolean(enabled),
-        _ => unreachable!("the directive regex admits only V, R, Q, I, or B"),
+fn parse_directive_body(lex: &mut logos::Lexer<'_, RawToken>) -> String {
+    let slice = lex.slice();
+    if let Some(body) = slice
+        .strip_prefix("{$")
+        .and_then(|body| body.strip_suffix('}'))
+    {
+        body.to_owned()
+    } else if let Some(body) = slice
+        .strip_prefix("(*$")
+        .and_then(|body| body.strip_suffix("*)"))
+    {
+        body.to_owned()
+    } else {
+        unreachable!("directive regex guarantees one supported delimiter")
     }
 }
 
@@ -208,8 +207,12 @@ impl std::fmt::Display for TokenKind {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Token {
     pub kind: TokenKind,
+    /// Monotonic location in the preprocessed token stream.
     pub span: Span,
+    /// Physical source location before include expansion.
+    pub origin: SourceSpan,
     pub modes: ModeSnapshot,
+    pub directive_state: DirectiveStateId,
 }
 
 impl std::fmt::Display for Token {
@@ -222,19 +225,95 @@ impl std::fmt::Display for Token {
 pub struct LexOutput {
     pub tokens: Vec<Token>,
     pub diagnostics: Vec<Diagnostic>,
+    pub sources: Vec<SourceInfo>,
+    pub dependencies: Vec<IncludeDependency>,
+    pub directives: Vec<DirectiveEvent>,
+    pub macro_expansions: Vec<MacroExpansion>,
+    pub source_map: Vec<SourceMapEntry>,
+    pub directive_states: Vec<DirectiveState>,
+    pub final_directive_state: DirectiveStateId,
+    pub logical_len: usize,
 }
 
-fn apply_directive(modes: &mut ModeSnapshot, directive: ModeDirective) {
-    match directive {
-        ModeDirective::VarString(enabled) => modes.var_string_checks = enabled,
-        ModeDirective::Range(enabled) => modes.range_checks = enabled,
-        ModeDirective::Overflow(enabled) => modes.overflow_checks = enabled,
-        ModeDirective::Io(enabled) => modes.io_checks = enabled,
-        ModeDirective::CompleteBoolean(enabled) => modes.complete_boolean_eval = enabled,
+impl LexOutput {
+    pub fn source(&self, source: SourceId) -> Option<&SourceInfo> {
+        self.sources.get(source.as_u32() as usize)
+    }
+
+    pub fn directive_state(&self, state: DirectiveStateId) -> Option<&DirectiveState> {
+        self.directive_states.get(state.as_u32() as usize)
+    }
+
+    pub fn physical_text(&self, span: &SourceSpan) -> Option<&str> {
+        self.source(span.source)?.text.get(span.range.clone())
     }
 }
 
-fn lower_raw(raw: RawToken) -> Option<TokenKind> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceInfo {
+    pub id: SourceId,
+    pub name: String,
+    pub text: String,
+    pub byte_len: usize,
+    pub line_starts: Vec<usize>,
+    pub included_from: Option<SourceSpan>,
+    pub synthetic: bool,
+}
+
+impl SourceInfo {
+    pub fn line_column(&self, byte_offset: usize) -> Option<(usize, usize)> {
+        if byte_offset > self.byte_len {
+            return None;
+        }
+        let line = self
+            .line_starts
+            .partition_point(|start| *start <= byte_offset);
+        let line_index = line.saturating_sub(1);
+        Some((
+            line_index + 1,
+            byte_offset.saturating_sub(self.line_starts[line_index]) + 1,
+        ))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IncludeDependency {
+    pub directive: SourceSpan,
+    pub included: SourceId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectiveEvent {
+    pub name: String,
+    pub origin: SourceSpan,
+    pub active: bool,
+    pub recognized: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MacroExpansion {
+    pub name: String,
+    pub invocation: SourceSpan,
+    pub expanded_source: SourceId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceMapEntryKind {
+    Token,
+    Directive,
+    MacroInvocation,
+    Inactive,
+    Invalid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceMapEntry {
+    pub logical: Span,
+    pub physical: SourceSpan,
+    pub kind: SourceMapEntryKind,
+}
+
+pub(crate) fn lower_raw(raw: RawToken) -> Option<TokenKind> {
     Some(match raw {
         RawToken::Directive(_) | RawToken::Comment => return None,
         RawToken::Identifier(value) => TokenKind::Identifier(value),
@@ -267,32 +346,23 @@ fn lower_raw(raw: RawToken) -> Option<TokenKind> {
     })
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RawLexeme {
+    pub token: Result<RawToken, ()>,
+    pub span: Span,
+}
+
+pub(crate) fn raw_lex(source: &str) -> Vec<RawLexeme> {
+    RawToken::lexer(source)
+        .spanned()
+        .map(|(token, span)| RawLexeme { token, span })
+        .collect()
+}
+
 pub fn lex(source: &str) -> LexOutput {
-    let mut modes = ModeSnapshot::default();
-    let mut tokens = Vec::new();
-    let mut diagnostics = Vec::new();
+    lex_named("<memory>", source)
+}
 
-    for (raw, span) in RawToken::lexer(source).spanned() {
-        match raw {
-            Ok(RawToken::Directive(directive)) => apply_directive(&mut modes, directive),
-            Ok(raw) => {
-                if let Some(kind) = lower_raw(raw) {
-                    tokens.push(Token { kind, span, modes });
-                }
-            }
-            Err(()) => {
-                diagnostics.push(Diagnostic::new(span.clone(), "invalid source token"));
-                tokens.push(Token {
-                    kind: TokenKind::Error,
-                    span,
-                    modes,
-                });
-            }
-        }
-    }
-
-    LexOutput {
-        tokens,
-        diagnostics,
-    }
+pub fn lex_named(source_name: &str, source: &str) -> LexOutput {
+    preprocess(source_name, source, &PreprocessorOptions::default())
 }

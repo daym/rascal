@@ -2,6 +2,25 @@ use std::ops::Range;
 
 pub type Span = Range<usize>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SourceId(u32);
+
+impl SourceId {
+    pub(crate) fn from_index(index: usize) -> Self {
+        Self(u32::try_from(index).expect("source registry exceeded u32::MAX entries"))
+    }
+
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SourceSpan {
+    pub source: SourceId,
+    pub range: Span,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ModeSnapshot {
     pub var_string_checks: bool,

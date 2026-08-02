@@ -43,6 +43,7 @@ pub struct BoundFile {
     pub environment: EnvironmentId,
     pub declaration_count: usize,
     pub unsupported_declarations: usize,
+    pub final_directive_state: crate::DirectiveState,
 }
 
 #[derive(Debug)]
@@ -69,6 +70,7 @@ struct ParsedInput {
     file: PascalFile,
     declarations: crate::declaration_ast::DeclarationParseOutput,
     body_tokens: Vec<Token>,
+    final_directive_state: crate::DirectiveState,
     module: Option<ModuleId>,
 }
 
@@ -278,6 +280,7 @@ impl CompilationDriver {
                 environment,
                 declaration_count: input.declarations.declaration_count,
                 unsupported_declarations: input.declarations.unsupported_count,
+                final_directive_state: input.final_directive_state.clone(),
             });
         }
     }
@@ -4768,10 +4771,23 @@ fn install_builtins(binder: &mut SemanticBinder) -> BuiltinTypes {
 }
 
 pub fn bind_sources(sources: &[(&str, &str)]) -> SemanticCompilation {
+    bind_sources_with_options(sources, &crate::PreprocessorOptions::default())
+}
+
+pub fn bind_sources_with_options(
+    sources: &[(&str, &str)],
+    preprocessor_options: &crate::PreprocessorOptions,
+) -> SemanticCompilation {
     let mut driver = CompilationDriver::new();
     let mut inputs = Vec::new();
     for (source_name, source) in sources {
-        let parsed = pascal_parser::parse(source);
+        let lexed = crate::preprocess(source_name, source, preprocessor_options);
+        let final_directive_state = lexed
+            .directive_state(lexed.final_directive_state)
+            .cloned()
+            .unwrap_or_default();
+        let mut parsed = pascal_parser::parse_tokens(&lexed.tokens, lexed.logical_len);
+        parsed.diagnostics.splice(0..0, lexed.diagnostics);
         driver.diagnostics.extend(parsed.diagnostics);
         let Some(file) = parsed.file else {
             continue;
@@ -4785,6 +4801,7 @@ pub fn bind_sources(sources: &[(&str, &str)]) -> SemanticCompilation {
             body_tokens: section_tokens(&file, PascalSectionKind::Body)
                 .map(strip_compound_body)
                 .unwrap_or_default(),
+            final_directive_state,
             file,
             declarations,
             module: None,

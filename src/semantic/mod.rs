@@ -32,7 +32,7 @@ pub use expressions::{
     BoundSetElement, BoundStatement, BoundStatementKind, BoundTryContinuation, ExpressionCategory,
     PropertyAccessKind, SemanticUse,
 };
-pub use frontend::{BoundFile, SemanticCompilation, bind_sources};
+pub use frontend::{BoundFile, SemanticCompilation, bind_sources, bind_sources_with_options};
 pub use ids::{
     DeclId, EnvironmentId, ModuleId, NameId, NodeId, ReceiverId, RegionId, StorageId, SymbolId,
     TypeRef, TypeSectionId,

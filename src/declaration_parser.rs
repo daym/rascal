@@ -5,9 +5,9 @@ use crate::{
     declaration_ast::{
         AggregateSyntaxKind, CallingConventionSyntax, DeclarationParseOutput, DeclarationSyntax,
         EnumMemberSyntax, FormalModeSyntax, FormalParameterSyntax, ParsedDeclarationSection,
-        RoutineDeclarationSyntax, RoutineSyntaxKind, SpannedName, TypeDeclarationSyntax,
-        TypeSyntax, TypeSyntaxKind, ValueDeclarationSyntax, VariantAlternativeSyntax,
-        VariantPartSyntax,
+        PropertyDeclarationSyntax, RoutineDeclarationSyntax, RoutineSyntaxKind, SpannedName,
+        TypeDeclarationSyntax, TypeSyntax, TypeSyntaxKind, ValueDeclarationSyntax,
+        VariantAlternativeSyntax, VariantPartSyntax,
     },
 };
 
@@ -96,12 +96,24 @@ fn opens_aggregate(tokens: &[Token], index: usize) -> bool {
     if !is_keyword(&tokens[index], "class") {
         return false;
     }
+    let starts_type_declaration = index > 0 && tokens[index - 1].kind == TokenKind::Equal;
     if tokens
         .get(index + 1)
         .is_some_and(|token| token.kind == TokenKind::Semicolon)
-        || tokens
-            .get(index + 1)
-            .is_some_and(|token| is_keyword(token, "of"))
+        || tokens.get(index + 1).is_some_and(|token| {
+            is_keyword(token, "of")
+                || !starts_type_declaration
+                    && [
+                        "procedure",
+                        "function",
+                        "constructor",
+                        "destructor",
+                        "operator",
+                        "var",
+                    ]
+                    .iter()
+                    .any(|word| is_keyword(token, word))
+        })
     {
         return false;
     }
@@ -297,7 +309,7 @@ fn expression_syntax(tokens: &[Token]) -> Option<crate::Expr> {
 fn aggregate_end(tokens: &[Token], opening: usize) -> Option<usize> {
     let mut depth = 0usize;
     for index in opening..tokens.len() {
-        if opens_aggregate(tokens, index) {
+        if index == opening || opens_aggregate(tokens, index) {
             depth += 1;
         } else if is_keyword(&tokens[index], "end") && depth > 0 {
             depth -= 1;
@@ -1240,7 +1252,15 @@ impl<'a> DeclarationScanner<'a> {
                 modes: self.tokens[start].modes,
             });
         self.index = end_exclusive;
-        DeclarationSyntax::Property(value)
+        DeclarationSyntax::Property(PropertyDeclarationSyntax {
+            value,
+            readable: self.tokens[start..end_exclusive]
+                .iter()
+                .any(|token| is_keyword(token, "read")),
+            writable: self.tokens[start..end_exclusive]
+                .iter()
+                .any(|token| is_keyword(token, "write")),
+        })
     }
 
     fn unsupported_to(&mut self, end: usize) -> DeclarationSyntax {

@@ -204,16 +204,19 @@ pub enum Statement {
         condition: Expr,
         then_branch: Box<Statement>,
         else_branch: Option<Box<Statement>>,
+        modes: ModeSnapshot,
         span: Span,
     },
     While {
         condition: Expr,
         body: Box<Statement>,
+        modes: ModeSnapshot,
         span: Span,
     },
     Repeat {
         body: Vec<Statement>,
         condition: Expr,
+        modes: ModeSnapshot,
         span: Span,
     },
     For {
@@ -267,6 +270,7 @@ pub enum Statement {
     Continue(Span),
     Exit {
         value: Option<Expr>,
+        modes: ModeSnapshot,
         span: Span,
     },
     InlineVariable {

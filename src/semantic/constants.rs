@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{Literal, ModeSnapshot, Operator};
 
 use super::{
-    ApplicationSelection, BoundApplicationTarget, BoundExpression, BoundExpressionKind,
-    BoundSetElement, SymbolId, TypeRef, TypeRegistry,
+    ApplicationSelection, ArgumentConversion, BoundApplicationTarget, BoundExpression,
+    BoundExpressionKind, BoundSetElement, ExplicitConversion, ResolvedConversion, SymbolId,
+    TypeRef, TypeRegistry, ValueConversionOperation,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,6 +87,13 @@ impl<'a> ConstantEvaluator<'a> {
         expected: Option<TypeRef>,
         declaration_modes: ModeSnapshot,
     ) -> Result<ConstantEntry, ConstantEvaluationError> {
+        if expression
+            .conversion
+            .as_ref()
+            .is_some_and(conversion_uses_custom_operator)
+        {
+            return Err(ConstantEvaluationError::NotConstant);
+        }
         match &expression.kind {
             BoundExpressionKind::Literal(literal) => {
                 let ty = expected
@@ -125,6 +133,9 @@ impl<'a> ConstantEvaluator<'a> {
             } => {
                 if !application_selected(target) {
                     return Err(ConstantEvaluationError::UnresolvedApplication);
+                }
+                if application_uses_custom_conversion(target) {
+                    return Err(ConstantEvaluationError::NotConstant);
                 }
                 match target {
                     BoundApplicationTarget::Operator { operator, .. } => {
@@ -371,4 +382,52 @@ fn application_selected(target: &BoundApplicationTarget) -> bool {
         BoundApplicationTarget::Invalid => return false,
     };
     matches!(selection, ApplicationSelection::Selected { .. })
+}
+
+fn application_uses_custom_conversion(target: &BoundApplicationTarget) -> bool {
+    let resolution = match target {
+        BoundApplicationTarget::Routine { resolution }
+        | BoundApplicationTarget::CallableValue { resolution }
+        | BoundApplicationTarget::Conversion { resolution, .. }
+        | BoundApplicationTarget::Operator { resolution, .. } => resolution,
+        BoundApplicationTarget::Invalid => return false,
+    };
+    resolution.selected_attempt().is_some_and(|attempt| {
+        attempt.arguments.iter().any(|argument| {
+            argument
+                .conversion
+                .as_ref()
+                .is_some_and(argument_conversion_uses_custom_operator)
+        })
+    })
+}
+
+fn conversion_uses_custom_operator(conversion: &super::ConversionResolution) -> bool {
+    match conversion.selected() {
+        Some(ResolvedConversion::Implicit(conversion)) => matches!(
+            conversion.operation,
+            ValueConversionOperation::CustomOperator { .. }
+        ),
+        Some(ResolvedConversion::Explicit(ExplicitConversion::CustomOperator { .. })) => true,
+        Some(ResolvedConversion::Explicit(ExplicitConversion::Value(conversion))) => matches!(
+            conversion.operation,
+            ValueConversionOperation::CustomOperator { .. }
+        ),
+        Some(ResolvedConversion::Explicit(
+            ExplicitConversion::IntegerTruncate { .. }
+            | ExplicitConversion::PointerCrossing { .. }
+            | ExplicitConversion::RelatedDowncast { .. }
+            | ExplicitConversion::RepresentationOverlay { .. },
+        ))
+        | None => false,
+    }
+}
+
+fn argument_conversion_uses_custom_operator(conversion: &ArgumentConversion) -> bool {
+    match conversion {
+        ArgumentConversion::Implicit(conversion) | ArgumentConversion::Explicit(conversion) => {
+            conversion_uses_custom_operator(conversion)
+        }
+        ArgumentConversion::Storage(_) => false,
+    }
 }

@@ -72,7 +72,7 @@ pub enum SymbolKind {
     Routine(TypeRef),
     Constant(TypeRef),
     Variable(TypeRef),
-    Property(TypeRef),
+    Property(PropertySymbol),
     Label,
 }
 
@@ -90,14 +90,20 @@ impl SymbolKind {
 
     pub const fn ty(&self) -> Option<TypeRef> {
         match self {
-            Self::Type(ty)
-            | Self::Routine(ty)
-            | Self::Constant(ty)
-            | Self::Variable(ty)
-            | Self::Property(ty) => Some(*ty),
+            Self::Type(ty) | Self::Routine(ty) | Self::Constant(ty) | Self::Variable(ty) => {
+                Some(*ty)
+            }
+            Self::Property(property) => Some(property.ty),
             Self::Label => None,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PropertySymbol {
+    pub ty: TypeRef,
+    pub readable: bool,
+    pub writable: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

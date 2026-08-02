@@ -6,8 +6,9 @@ use crate::{
     TryContinuation, chumsky_parser,
     declaration_ast::{
         AggregateSyntaxKind, CallingConventionSyntax, DeclarationSyntax, EnumMemberSyntax,
-        FormalModeSyntax, FormalParameterSyntax, RoutineDeclarationSyntax, RoutineSyntaxKind,
-        SpannedName, TypeDeclarationSyntax, TypeSyntax, TypeSyntaxKind, ValueDeclarationSyntax,
+        FormalModeSyntax, FormalParameterSyntax, PropertyDeclarationSyntax,
+        RoutineDeclarationSyntax, RoutineSyntaxKind, SpannedName, TypeDeclarationSyntax,
+        TypeSyntax, TypeSyntaxKind, ValueDeclarationSyntax,
     },
     declaration_parser::{parse_file_declarations, section_tokens},
     operator_declaration_spec, operator_declaration_specs, operator_invocation_identifier,
@@ -17,17 +18,19 @@ use crate::{
 use super::{
     ActualArgument, AggregateDefinition, AggregateKind, AliasType, ApplicationCandidate,
     ApplicationReceiver, ApplicationResolution, ApplicationResolver, ApplicationSelection,
-    ArrayType, BindError, BoundApplicationTarget, BoundBody, BoundCaseArm, BoundCaseLabel,
-    BoundExceptionHandler, BoundExpression, BoundExpressionKind, BoundSetElement, BoundStatement,
-    BoundStatementKind, BoundTryContinuation, CallableFlavor, CallableType, CallingConvention,
-    Capture, ConstantEntry, ConstantEvaluator, ConstantValue, DeclarationMode, DeclarationState,
-    DeclaredRoutine, EnumMember, EnumType, EnvironmentId, EnvironmentRequirement, FieldLayout,
-    FormalParameter, FrameKind, IncompleteReason, LookupBarrier, LookupEdge, LookupRequest,
-    LookupResult, ModuleGraphError, ModuleId, ModulePhase, ModuleRegistry, NameId, NodeId,
-    OpaqueType, OrdinalDomain, ParameterMode, PointerType, PrimitiveKind, PrimitiveType,
-    ReceiverId, RegionOwner, RoutineOwner, RoutineSignature, SemanticBinder, SetType,
-    StorageLayout, SubrangeType, SymbolCategory, SymbolFilter, SymbolId, SymbolKind, TypeOwner,
-    TypeRef, UnitType, VariantAlternative, VariantPart,
+    ArrayType, BindError, BoundApplicationTarget, BoundAssignment, BoundBody, BoundCaseArm,
+    BoundCaseLabel, BoundExceptionHandler, BoundExpression, BoundExpressionKind, BoundSetElement,
+    BoundStatement, BoundStatementKind, BoundTryContinuation, CallableFlavor, CallableType,
+    CallingConvention, Capture, ConstantEntry, ConstantEvaluator, ConstantValue,
+    ConversionResolution, ConversionResolver, ConversionSelection, DeclarationMode,
+    DeclarationState, DeclaredRoutine, EnumMember, EnumType, EnvironmentId, EnvironmentRequirement,
+    ExpressionCategory, FieldLayout, FormalParameter, FrameKind, IncompleteReason, LookupBarrier,
+    LookupEdge, LookupRequest, LookupResult, ModuleGraphError, ModuleId, ModulePhase,
+    ModuleRegistry, NameId, NodeId, OpaqueType, OrdinalDomain, ParameterMode, PointerType,
+    PrimitiveKind, PrimitiveType, PropertySymbol, ReceiverId, RegionOwner, RoutineOwner,
+    RoutineSignature, SemanticBinder, SemanticUse, SetType, StorageLayout, SubrangeType,
+    SymbolCategory, SymbolFilter, SymbolId, SymbolKind, TypeOwner, TypeRef, UnitType,
+    VariantAlternative, VariantPart,
 };
 
 #[derive(Clone, Debug)]
@@ -947,11 +950,28 @@ impl CompilationDriver {
             .ty
             .as_ref()
             .and_then(|syntax| self.resolve_type(syntax));
-        let initializer = declaration
+        let mut initializer = declaration
             .initializer
             .as_ref()
             .map(|initializer| self.bind_expression(initializer, None));
-        let constant_entry = if constant {
+        let constant_conversion_valid = if constant
+            && let (Some(destination), Some(initializer)) = (explicit_type, initializer.as_mut())
+        {
+            initializer.ty.is_none()
+                || self
+                    .apply_implicit_conversion(
+                        initializer,
+                        destination,
+                        declaration.modes,
+                        "constant is not convertible to its declared type",
+                    )
+                    .is_some_and(|resolution| {
+                        matches!(resolution.selection, ConversionSelection::Selected { .. })
+                    })
+        } else {
+            true
+        };
+        let constant_entry = if constant && constant_conversion_valid {
             initializer.as_ref().and_then(|initializer| {
                 let evaluator = ConstantEvaluator::new(&self.binder.constants, &self.binder.types);
                 match evaluator.evaluate_with_modes(initializer, explicit_type, declaration.modes) {
@@ -978,19 +998,13 @@ impl CompilationDriver {
                 "constant declaration requires an initializer",
             ));
         }
-        if !constant
-            && let Some(initializer_type) =
-                initializer.as_ref().and_then(|initializer| initializer.ty)
-            && self
-                .binder
-                .types
-                .value_conversion(ty, initializer_type)
-                .is_none()
-        {
-            self.diagnostics.push(Diagnostic::new(
-                declaration.span.clone(),
+        if !constant && let Some(initializer) = initializer.as_mut() {
+            self.apply_implicit_conversion(
+                initializer,
+                ty,
+                declaration.modes,
                 "variable initializer is not convertible to its declared type",
-            ));
+            );
         }
         self.binder.scopes.extend_environment(if constant {
             FrameKind::ConstSection
@@ -1026,7 +1040,20 @@ impl CompilationDriver {
         expected: Option<TypeRef>,
         modes: crate::ModeSnapshot,
     ) -> Option<ConstantEntry> {
-        let bound = self.bind_expression(expression, None);
+        let mut bound = self.bind_expression(expression, None);
+        if let Some(expected) = expected
+            && bound.ty.is_some()
+        {
+            let resolution = self.apply_implicit_conversion(
+                &mut bound,
+                expected,
+                modes,
+                "constant is not convertible to its declared type",
+            )?;
+            if !matches!(resolution.selection, ConversionSelection::Selected { .. }) {
+                return None;
+            }
+        }
         let evaluator = ConstantEvaluator::new(&self.binder.constants, &self.binder.types);
         match evaluator.evaluate_with_modes(&bound, expected, modes) {
             Ok(entry) => Some(entry),
@@ -1082,23 +1109,28 @@ impl CompilationDriver {
         }
     }
 
-    fn bind_properties(&mut self, declaration: &ValueDeclarationSyntax) {
+    fn bind_properties(&mut self, declaration: &PropertyDeclarationSyntax) {
         let Some(ty) = declaration
+            .value
             .ty
             .as_ref()
             .and_then(|syntax| self.resolve_type(syntax))
         else {
             self.diagnostics.push(Diagnostic::new(
-                declaration.span.clone(),
+                declaration.value.span.clone(),
                 "property type could not be resolved",
             ));
             return;
         };
-        for name in &declaration.names {
+        for name in &declaration.value.names {
             let name_id = self.binder.scopes.intern_name(&name.spelling);
             if let Err(error) = self.binder.scopes.declare(
                 name_id,
-                SymbolKind::Property(ty),
+                SymbolKind::Property(PropertySymbol {
+                    ty,
+                    readable: declaration.readable,
+                    writable: declaration.writable,
+                }),
                 DeclarationState::Complete,
                 DeclarationMode::Fresh,
             ) {
@@ -1400,7 +1432,7 @@ impl CompilationDriver {
             },
             Statement::Assignment(application) => BoundStatement {
                 span: application.span.clone(),
-                kind: BoundStatementKind::Assignment(self.bind_application(application, owner)),
+                kind: BoundStatementKind::Assignment(self.bind_assignment(application, owner)),
             },
             Statement::Compound { statements, span } => BoundStatement {
                 span: span.clone(),
@@ -1410,9 +1442,10 @@ impl CompilationDriver {
                 condition,
                 then_branch,
                 else_branch,
+                modes,
                 span,
             } => {
-                let condition = self.bind_condition(condition, owner);
+                let condition = self.bind_condition(condition, owner, *modes);
                 let then_branch = Box::new(self.bind_scoped_statement(then_branch, owner));
                 let else_branch = else_branch
                     .as_deref()
@@ -1429,23 +1462,25 @@ impl CompilationDriver {
             Statement::While {
                 condition,
                 body,
+                modes,
                 span,
             } => BoundStatement {
                 span: span.clone(),
                 kind: BoundStatementKind::While {
-                    condition: self.bind_condition(condition, owner),
+                    condition: self.bind_condition(condition, owner, *modes),
                     body: Box::new(self.bind_loop_body(body, owner)),
                 },
             },
             Statement::Repeat {
                 body,
                 condition,
+                modes,
                 span,
             } => BoundStatement {
                 span: span.clone(),
                 kind: BoundStatementKind::Repeat {
                     body: self.bind_loop_statements(body, owner),
-                    condition: self.bind_condition(condition, owner),
+                    condition: self.bind_condition(condition, owner, *modes),
                 },
             },
             Statement::For {
@@ -1458,24 +1493,18 @@ impl CompilationDriver {
                 modes,
             } => {
                 let control = self.lookup_control_variable(control, span.clone());
-                let initial = self.bind_expression(initial, owner);
-                let final_value = self.bind_expression(final_value, owner);
+                let mut initial = self.bind_expression(initial, owner);
+                let mut final_value = self.bind_expression(final_value, owner);
                 if let Some(symbol) = control {
                     let control_type = self.binder.scopes.symbol(symbol).kind.ty();
-                    for value in [&initial, &final_value] {
-                        if control_type
-                            .zip(value.ty)
-                            .is_none_or(|(destination, source)| {
-                                self.binder
-                                    .types
-                                    .value_conversion(destination, source)
-                                    .is_none()
-                            })
-                        {
-                            self.diagnostics.push(Diagnostic::new(
-                                value.span.clone(),
+                    if let Some(destination) = control_type {
+                        for value in [&mut initial, &mut final_value] {
+                            self.apply_implicit_conversion(
+                                value,
+                                destination,
+                                *modes,
                                 "for-loop bound is not convertible to the control type",
-                            ));
+                            );
                         }
                     }
                 }
@@ -1503,6 +1532,7 @@ impl CompilationDriver {
                 let element = source
                     .ty
                     .and_then(|ty| self.binder.types.sequence_element_type(ty));
+                let mut element_conversion = None;
                 if element.is_none() {
                     self.diagnostics.push(Diagnostic::new(
                         source.span.clone(),
@@ -1510,19 +1540,21 @@ impl CompilationDriver {
                     ));
                 } else if let Some(symbol) = control {
                     let control_type = self.binder.scopes.symbol(symbol).kind.ty();
-                    if control_type
-                        .zip(element)
-                        .is_none_or(|(destination, source)| {
-                            self.binder
-                                .types
-                                .value_conversion(destination, source)
-                                .is_none()
-                        })
-                    {
-                        self.diagnostics.push(Diagnostic::new(
-                            span.clone(),
-                            "for-in element is not convertible to the control type",
-                        ));
+                    if let Some((destination, source)) = control_type.zip(element) {
+                        let resolution = ConversionResolver::new(
+                            &self.binder.types,
+                            &self.binder.scopes,
+                            self.binder.scopes.current_environment(),
+                            *modes,
+                        )
+                        .resolve_implicit(destination, source);
+                        if !matches!(resolution.selection, ConversionSelection::Selected { .. }) {
+                            self.diagnostics.push(Diagnostic::new(
+                                span.clone(),
+                                "for-in element is not convertible to the control type",
+                            ));
+                        }
+                        element_conversion = Some(resolution);
                     }
                 }
                 BoundStatement {
@@ -1530,6 +1562,7 @@ impl CompilationDriver {
                     kind: BoundStatementKind::ForIn {
                         control,
                         source,
+                        element_conversion,
                         body: Box::new(self.bind_loop_body(body, owner)),
                         modes: *modes,
                     },
@@ -1743,33 +1776,25 @@ impl CompilationDriver {
                     kind: BoundStatementKind::Continue,
                 }
             }
-            Statement::Exit { value, span } => {
-                let value = value
+            Statement::Exit { value, modes, span } => {
+                let mut value = value
                     .as_ref()
                     .map(|value| self.bind_expression(value, owner));
                 let result = owner
                     .and_then(|owner| self.binder.types.callable(owner))
                     .and_then(|callable| callable.signature.result);
-                match (result, value.as_ref().and_then(|value| value.ty)) {
-                    (Some(destination), Some(source))
-                        if self
-                            .binder
-                            .types
-                            .value_conversion(destination, source)
-                            .is_none() =>
-                    {
-                        self.diagnostics.push(Diagnostic::new(
-                            span.clone(),
+                match (result, value.as_mut()) {
+                    (Some(destination), Some(value)) => {
+                        self.apply_implicit_conversion(
+                            value,
+                            destination,
+                            *modes,
                             "exit value is not convertible to the function result",
-                        ));
+                        );
                     }
                     (None, Some(_)) => self.diagnostics.push(Diagnostic::new(
                         span.clone(),
                         "procedure exit cannot carry a result value",
-                    )),
-                    (Some(_), None) if value.is_some() => self.diagnostics.push(Diagnostic::new(
-                        span.clone(),
-                        "exit result has no semantic type",
                     )),
                     _ => {}
                 }
@@ -1785,7 +1810,7 @@ impl CompilationDriver {
                 modes,
                 span,
             } => {
-                let initializer = initializer
+                let mut initializer = initializer
                     .as_ref()
                     .map(|initializer| self.bind_expression(initializer, owner));
                 let explicit_type = type_name
@@ -1807,19 +1832,15 @@ impl CompilationDriver {
                         },
                     };
                 };
-                if let (Some(destination), Some(source)) = (
-                    explicit_type,
-                    initializer.as_ref().and_then(|initializer| initializer.ty),
-                ) && self
-                    .binder
-                    .types
-                    .value_conversion(destination, source)
-                    .is_none()
+                if let (Some(destination), Some(initializer)) =
+                    (explicit_type, initializer.as_mut())
                 {
-                    self.diagnostics.push(Diagnostic::new(
-                        span.clone(),
+                    self.apply_implicit_conversion(
+                        initializer,
+                        destination,
+                        *modes,
                         "inline initializer is not convertible to its declared type",
-                    ));
+                    );
                 }
                 let block = self.next_block;
                 self.next_block += 1;
@@ -1904,19 +1925,19 @@ impl CompilationDriver {
         result
     }
 
-    fn bind_condition(&mut self, expression: &Expr, owner: Option<TypeRef>) -> BoundExpression {
-        let condition = self.bind_expression(expression, owner);
-        if condition.ty.is_none_or(|source| {
-            self.binder
-                .types
-                .value_conversion(self.builtins.boolean, source)
-                .is_none()
-        }) {
-            self.diagnostics.push(Diagnostic::new(
-                expression.span.clone(),
-                "condition is not Boolean-compatible",
-            ));
-        }
+    fn bind_condition(
+        &mut self,
+        expression: &Expr,
+        owner: Option<TypeRef>,
+        modes: crate::ModeSnapshot,
+    ) -> BoundExpression {
+        let mut condition = self.bind_expression_for(expression, owner, SemanticUse::Condition);
+        self.apply_implicit_conversion(
+            &mut condition,
+            self.builtins.boolean,
+            modes,
+            "condition is not Boolean-compatible",
+        );
         condition
     }
 
@@ -2022,6 +2043,51 @@ impl CompilationDriver {
     }
 
     fn bind_expression(&mut self, expression: &Expr, owner: Option<TypeRef>) -> BoundExpression {
+        self.bind_expression_for(expression, owner, SemanticUse::Value)
+    }
+
+    fn bind_expression_for(
+        &mut self,
+        expression: &Expr,
+        owner: Option<TypeRef>,
+        semantic_use: SemanticUse,
+    ) -> BoundExpression {
+        let mut bound = self.bind_expression_raw(expression, owner);
+        bound.semantic_use = semantic_use;
+        if bound.category == ExpressionCategory::Error {
+            return bound;
+        }
+        let accepted = match semantic_use {
+            SemanticUse::Value | SemanticUse::Condition => !matches!(
+                bound.category,
+                ExpressionCategory::Property {
+                    readable: false,
+                    ..
+                }
+            ),
+            SemanticUse::MutablePlace => bound.category.is_mutable_storage(),
+            SemanticUse::AssignmentTarget => bound.category.is_assignment_target(),
+            SemanticUse::Address => bound.category.is_addressable(),
+        };
+        if !accepted {
+            let description = match semantic_use {
+                SemanticUse::Value => "expression does not produce a readable value",
+                SemanticUse::MutablePlace => "expression is not mutable storage",
+                SemanticUse::AssignmentTarget => "left side of assignment is not writable",
+                SemanticUse::Condition => "condition does not produce a readable value",
+                SemanticUse::Address => "address operand is not storage",
+            };
+            self.diagnostics
+                .push(Diagnostic::new(expression.span.clone(), description));
+        }
+        bound
+    }
+
+    fn bind_expression_raw(
+        &mut self,
+        expression: &Expr,
+        owner: Option<TypeRef>,
+    ) -> BoundExpression {
         match &expression.kind {
             ExprKind::Identifier(name) => {
                 self.bind_identifier(name, expression.span.clone(), owner, false)
@@ -2047,6 +2113,9 @@ impl CompilationDriver {
                     Literal::Real(_) | Literal::Nil => None,
                 },
                 kind: BoundExpressionKind::Literal(literal.clone()),
+                category: ExpressionCategory::Value,
+                semantic_use: SemanticUse::Value,
+                conversion: None,
                 span: expression.span.clone(),
             },
             ExprKind::Application(application) => self.bind_application(application, owner),
@@ -2075,13 +2144,17 @@ impl CompilationDriver {
                     return bound_error(expression.span.clone());
                 };
                 let symbol = result.primary[0].symbol;
-                let ty = self.binder.scopes.symbol(symbol).kind.ty();
+                let symbol_kind = self.binder.scopes.symbol(symbol).kind.clone();
+                let ty = symbol_kind.ty();
                 BoundExpression {
                     kind: BoundExpressionKind::Member {
                         base: Box::new(base),
                         symbol,
                     },
                     ty,
+                    category: expression_category_for_symbol(&symbol_kind),
+                    semantic_use: SemanticUse::Value,
+                    conversion: None,
                     span: expression.span.clone(),
                 }
             }
@@ -2100,12 +2173,20 @@ impl CompilationDriver {
                         "indexing requires a sequence type",
                     ));
                 }
+                let category = if base.category.is_mutable_storage() {
+                    ExpressionCategory::Storage { mutable: true }
+                } else {
+                    ExpressionCategory::Temporary
+                };
                 BoundExpression {
                     kind: BoundExpressionKind::Index {
                         base: Box::new(base),
                         indices,
                     },
                     ty,
+                    category,
+                    semantic_use: SemanticUse::Value,
+                    conversion: None,
                     span: expression.span.clone(),
                 }
             }
@@ -2121,6 +2202,9 @@ impl CompilationDriver {
                 BoundExpression {
                     kind: BoundExpressionKind::Dereference(Box::new(base)),
                     ty,
+                    category: ExpressionCategory::Storage { mutable: true },
+                    semantic_use: SemanticUse::Value,
+                    conversion: None,
                     span: expression.span.clone(),
                 }
             }
@@ -2142,6 +2226,9 @@ impl CompilationDriver {
                 BoundExpression {
                     kind: BoundExpressionKind::Set(bound),
                     ty: None,
+                    category: ExpressionCategory::Temporary,
+                    semantic_use: SemanticUse::Value,
+                    conversion: None,
                     span: expression.span.clone(),
                 }
             }
@@ -2181,7 +2268,49 @@ impl CompilationDriver {
         BoundExpression {
             ty: kind.ty(),
             kind: BoundExpressionKind::Symbol { symbol, receiver },
+            category: expression_category_for_symbol(&kind),
+            semantic_use: SemanticUse::Value,
+            conversion: None,
             span,
+        }
+    }
+
+    fn bind_assignment(
+        &mut self,
+        application: &Application,
+        owner: Option<TypeRef>,
+    ) -> BoundAssignment {
+        let mut operands = application.operands.iter();
+        let mut target = operands.next().map_or_else(
+            || bound_error(application.span.clone()),
+            |target| self.bind_expression_for(target, owner, SemanticUse::AssignmentTarget),
+        );
+        let mut source = operands.next().map_or_else(
+            || bound_error(application.span.clone()),
+            |source| self.bind_expression_for(source, owner, SemanticUse::Value),
+        );
+        if operands.next().is_some() || application.operands.len() != 2 {
+            self.diagnostics.push(Diagnostic::new(
+                application.span.clone(),
+                "assignment requires exactly one target and one source",
+            ));
+        }
+        let conversion = match (target.ty, source.ty) {
+            (Some(destination), Some(_)) if target.category.is_assignment_target() => self
+                .apply_implicit_conversion(
+                    &mut source,
+                    destination,
+                    application.modes,
+                    "assignment source is not convertible to the target type",
+                ),
+            _ => None,
+        };
+        target.semantic_use = SemanticUse::AssignmentTarget;
+        BoundAssignment {
+            target,
+            source,
+            conversion,
+            modes: application.modes,
         }
     }
 
@@ -2190,10 +2319,16 @@ impl CompilationDriver {
         application: &Application,
         owner: Option<TypeRef>,
     ) -> BoundExpression {
+        let operand_use = match application.callee {
+            Callee::Operator(Operator::Address | Operator::ProcedureSlotAddress) => {
+                SemanticUse::Address
+            }
+            _ => SemanticUse::Value,
+        };
         let operands = application
             .operands
             .iter()
-            .map(|operand| self.bind_expression(operand, owner))
+            .map(|operand| self.bind_expression_for(operand, owner, operand_use))
             .collect::<Vec<_>>();
         match &application.callee {
             Callee::Expression(callee) => {
@@ -2221,6 +2356,9 @@ impl CompilationDriver {
                             modes: application.modes,
                         },
                         ty: None,
+                        category: ExpressionCategory::Error,
+                        semantic_use: SemanticUse::Value,
+                        conversion: None,
                         span: application.span.clone(),
                     };
                 };
@@ -2229,7 +2367,8 @@ impl CompilationDriver {
                     ApplicationCandidate::CallableValue { .. } => 1,
                     ApplicationCandidate::Conversion { .. } => unreachable!(),
                 };
-                let resolution = self.resolve_application(vec![candidate], &operands);
+                let resolution =
+                    self.resolve_application(vec![candidate], &operands, application.modes);
                 self.report_application_resolution(
                     &resolution,
                     application.span.clone(),
@@ -2249,6 +2388,9 @@ impl CompilationDriver {
                         modes: application.modes,
                     },
                     ty: result,
+                    category: ExpressionCategory::Temporary,
+                    semantic_use: SemanticUse::Value,
+                    conversion: None,
                     span: application.span.clone(),
                 }
             }
@@ -2289,6 +2431,7 @@ impl CompilationDriver {
                 let resolution = self.resolve_application(
                     vec![ApplicationCandidate::Conversion { destination }],
                     &operands,
+                    modes,
                 );
                 self.report_application_resolution(
                     &resolution,
@@ -2307,12 +2450,15 @@ impl CompilationDriver {
                         modes,
                     },
                     ty: result_type,
+                    category: ExpressionCategory::Temporary,
+                    semantic_use: SemanticUse::Value,
+                    conversion: None,
                     span,
                 }
             }
             SymbolKind::Routine(_) => {
                 let candidates = callable_candidates(&result, &self.binder, owner);
-                let resolution = self.resolve_application(candidates, &operands);
+                let resolution = self.resolve_application(candidates, &operands, modes);
                 self.report_application_resolution(
                     &resolution,
                     span.clone(),
@@ -2327,10 +2473,13 @@ impl CompilationDriver {
                         modes,
                     },
                     ty: result_type,
+                    category: ExpressionCategory::Temporary,
+                    semantic_use: SemanticUse::Value,
+                    conversion: None,
                     span,
                 }
             }
-            SymbolKind::Variable(callable_type) | SymbolKind::Property(callable_type)
+            SymbolKind::Variable(callable_type)
                 if self.binder.types.callable(callable_type).is_some() =>
             {
                 self.note_capture(owner, primary);
@@ -2343,6 +2492,7 @@ impl CompilationDriver {
                         },
                     }],
                     &operands,
+                    modes,
                 );
                 self.report_application_resolution(
                     &resolution,
@@ -2358,6 +2508,44 @@ impl CompilationDriver {
                         modes,
                     },
                     ty: result_type,
+                    category: ExpressionCategory::Temporary,
+                    semantic_use: SemanticUse::Value,
+                    conversion: None,
+                    span,
+                }
+            }
+            SymbolKind::Property(property)
+                if property.readable && self.binder.types.callable(property.ty).is_some() =>
+            {
+                self.note_capture(owner, primary);
+                let resolution = self.resolve_application(
+                    vec![ApplicationCandidate::CallableValue {
+                        symbol: Some(primary),
+                        callable_type: property.ty,
+                        receiver: ApplicationReceiver::CallableValue {
+                            lookup_receiver: primary_receiver,
+                        },
+                    }],
+                    &operands,
+                    modes,
+                );
+                self.report_application_resolution(
+                    &resolution,
+                    span.clone(),
+                    &format!("procedural property `{spelling}`"),
+                );
+                let result_type = resolution.result_type();
+                BoundExpression {
+                    kind: BoundExpressionKind::Application {
+                        target: BoundApplicationTarget::CallableValue { resolution },
+                        callee: None,
+                        operands,
+                        modes,
+                    },
+                    ty: result_type,
+                    category: ExpressionCategory::Temporary,
+                    semantic_use: SemanticUse::Value,
+                    conversion: None,
                     span,
                 }
             }
@@ -2380,9 +2568,14 @@ impl CompilationDriver {
         operands: Vec<BoundExpression>,
         modes: crate::ModeSnapshot,
     ) -> BoundExpression {
-        let name = if operator == Operator::Assign {
-            self.binder.scopes.intern_name(":builtin_assign")
-        } else {
+        if operator == Operator::Assign {
+            self.diagnostics.push(Diagnostic::new(
+                span.clone(),
+                "assignment is a store operation, not an operator application",
+            ));
+            return bound_application_error(span, operands, modes);
+        }
+        let name = {
             let invocation = match operator {
                 Operator::Positive | Operator::Negative | Operator::Not => {
                     Some(OperatorInvocation::UnaryToken)
@@ -2449,16 +2642,13 @@ impl CompilationDriver {
             .map_or_else(Vec::new, |result| {
                 callable_candidates(&result, &self.binder, None)
             });
-        let resolution = self.resolve_application(candidates, &operands);
+        let resolution = self.resolve_application(candidates, &operands, modes);
         self.report_application_resolution(
             &resolution,
             span.clone(),
             &format!("`{}` operator", operator.spelling()),
         );
-        let mut result_type = resolution.result_type();
-        if operator == Operator::Assign {
-            result_type = operands.first().and_then(|operand| operand.ty);
-        }
+        let result_type = resolution.result_type();
         BoundExpression {
             kind: BoundExpressionKind::Application {
                 target: BoundApplicationTarget::Operator {
@@ -2470,6 +2660,9 @@ impl CompilationDriver {
                 modes,
             },
             ty: result_type,
+            category: ExpressionCategory::Temporary,
+            semantic_use: SemanticUse::Value,
+            conversion: None,
             span,
         }
     }
@@ -2513,32 +2706,64 @@ impl CompilationDriver {
         &self,
         candidates: Vec<ApplicationCandidate>,
         operands: &[BoundExpression],
+        modes: crate::ModeSnapshot,
     ) -> ApplicationResolution {
         let actuals = operands
             .iter()
             .map(|operand| ActualArgument {
                 ty: operand.ty,
-                addressable: self.is_addressable(operand),
+                addressable: operand.category.is_addressable(),
             })
             .collect::<Vec<_>>();
-        ApplicationResolver::new(&self.binder.types, self.builtins.untyped_parameter)
-            .resolve(candidates, &actuals)
+        let conversions = ConversionResolver::new(
+            &self.binder.types,
+            &self.binder.scopes,
+            self.binder.scopes.current_environment(),
+            modes,
+        );
+        ApplicationResolver::new(
+            &self.binder.types,
+            self.builtins.untyped_parameter,
+            &conversions,
+        )
+        .resolve(candidates, &actuals)
     }
 
-    fn is_addressable(&self, expression: &BoundExpression) -> bool {
-        match &expression.kind {
-            BoundExpressionKind::Symbol { symbol, .. }
-            | BoundExpressionKind::Member { symbol, .. } => matches!(
-                self.binder.scopes.symbol(*symbol).kind,
-                SymbolKind::Variable(_)
-            ),
-            BoundExpressionKind::Index { base, .. } => self.is_addressable(base),
-            BoundExpressionKind::Dereference(_) => true,
-            BoundExpressionKind::Literal(_)
-            | BoundExpressionKind::Application { .. }
-            | BoundExpressionKind::Set(_)
-            | BoundExpressionKind::Error => false,
+    fn apply_implicit_conversion(
+        &mut self,
+        expression: &mut BoundExpression,
+        destination: TypeRef,
+        modes: crate::ModeSnapshot,
+        diagnostic: &str,
+    ) -> Option<ConversionResolution> {
+        let source = expression.ty?;
+        let resolution = ConversionResolver::new(
+            &self.binder.types,
+            &self.binder.scopes,
+            self.binder.scopes.current_environment(),
+            modes,
+        )
+        .resolve_implicit(destination, source);
+        match &resolution.selection {
+            ConversionSelection::Selected { .. } => {
+                expression.ty = Some(destination);
+                expression.conversion = Some(resolution.clone());
+            }
+            ConversionSelection::Ambiguous { attempts } => {
+                self.diagnostics.push(Diagnostic::new(
+                    expression.span.clone(),
+                    format!(
+                        "{diagnostic}: {} custom conversions are ambiguous",
+                        attempts.len()
+                    ),
+                ));
+            }
+            ConversionSelection::NoViable => {
+                self.diagnostics
+                    .push(Diagnostic::new(expression.span.clone(), diagnostic));
+            }
         }
+        Some(resolution)
     }
 
     fn report_application_resolution(
@@ -2871,10 +3096,27 @@ fn semantic_calling_convention(syntax: CallingConventionSyntax) -> CallingConven
     }
 }
 
+fn expression_category_for_symbol(kind: &SymbolKind) -> ExpressionCategory {
+    match kind {
+        SymbolKind::Variable(_) => ExpressionCategory::Storage { mutable: true },
+        SymbolKind::Property(property) => ExpressionCategory::Property {
+            readable: property.readable,
+            writable: property.writable,
+        },
+        SymbolKind::Type(_)
+        | SymbolKind::Routine(_)
+        | SymbolKind::Constant(_)
+        | SymbolKind::Label => ExpressionCategory::Value,
+    }
+}
+
 fn bound_error(span: Span) -> BoundExpression {
     BoundExpression {
         kind: BoundExpressionKind::Error,
         ty: None,
+        category: ExpressionCategory::Error,
+        semantic_use: SemanticUse::Value,
+        conversion: None,
         span,
     }
 }
@@ -2892,6 +3134,9 @@ fn bound_application_error(
             modes,
         },
         ty: None,
+        category: ExpressionCategory::Error,
+        semantic_use: SemanticUse::Value,
+        conversion: None,
         span,
     }
 }
@@ -3084,13 +3329,6 @@ fn install_system_callables(binder: &mut SemanticBinder, builtins: BuiltinTypes)
         true,
         &[builtins.boolean],
         Some(builtins.boolean),
-    );
-    let assignment = binder.scopes.intern_name(":builtin_assign");
-    callable(
-        binder,
-        assignment,
-        &[builtins.integer, builtins.integer],
-        None,
     );
     let high = binder.scopes.intern_name("high");
     callable(binder, high, &[builtins.integer], Some(builtins.integer));

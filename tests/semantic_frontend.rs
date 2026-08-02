@@ -193,10 +193,7 @@ fn local_type_high_binds_as_a_cast_before_system_high() {
     let BoundStatementKind::Assignment(assignment) = &body.statements[0].kind else {
         panic!("expected assignment")
     };
-    let BoundExpressionKind::Application { operands, .. } = &assignment.kind else {
-        panic!("expected bound assignment operator")
-    };
-    let BoundExpressionKind::Application { target, .. } = &operands[1].kind else {
+    let BoundExpressionKind::Application { target, .. } = &assignment.source.kind else {
         panic!("expected cast application")
     };
     assert!(matches!(target, BoundApplicationTarget::Conversion { .. }));

@@ -425,6 +425,7 @@ pub fn structured_statement_parser<'a>()
                         condition,
                         then_branch: Box::new(then_branch),
                         else_branch: else_branch.map(Box::new),
+                        modes: if_token.modes,
                         span: if_token.span.start..end,
                     }
                 });
@@ -438,6 +439,7 @@ pub fn structured_statement_parser<'a>()
                     Statement::While {
                         condition,
                         body: Box::new(body),
+                        modes: while_token.modes,
                         span: while_token.span.start..end,
                     }
                 });
@@ -450,6 +452,7 @@ pub fn structured_statement_parser<'a>()
                     span: repeat_token.span.start..condition.span.end,
                     body,
                     condition,
+                    modes: repeat_token.modes,
                 });
 
             let for_control = identifier();
@@ -684,6 +687,7 @@ pub fn structured_statement_parser<'a>()
                     });
                     Statement::Exit {
                         value,
+                        modes: token.modes,
                         span: token.span.start..end,
                     }
                 });

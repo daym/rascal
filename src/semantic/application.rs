@@ -1,6 +1,7 @@
 use super::{
-    CallableFlavor, ConstantValue, ExplicitConversion, ParameterMode, ReceiverId, SymbolId,
-    TypeRef, TypeRegistry, ValueConversion,
+    CallableFlavor, ConstantValue, ConversionResolution, ConversionResolver, ConversionSelection,
+    ParameterMode, ReceiverId, ResolvedConversion, SemanticUse, SymbolId, TypeRef, TypeRegistry,
+    ValueConversion,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,8 +65,9 @@ pub struct ActualArgument {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ArgumentConversion {
-    Implicit(ValueConversion),
-    Explicit(ExplicitConversion),
+    Implicit(ConversionResolution),
+    Explicit(ConversionResolution),
+    Storage(ValueConversion),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,6 +75,7 @@ pub struct ArgumentBinding {
     pub actual_index: usize,
     pub formal_index: usize,
     pub formal_type: TypeRef,
+    pub required_use: SemanticUse,
     pub conversion: Option<ArgumentConversion>,
 }
 
@@ -120,6 +123,11 @@ pub enum CandidateRejection {
         destination: TypeRef,
         source: TypeRef,
     },
+    AmbiguousConversion {
+        destination: TypeRef,
+        source: TypeRef,
+        attempts: Vec<usize>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,10 +148,11 @@ impl CandidateAttempt {
         self.arguments
             .iter()
             .filter_map(|argument| match argument.conversion.as_ref()? {
-                ArgumentConversion::Implicit(conversion) => {
-                    Some(conversion_rank_priority(conversion))
+                ArgumentConversion::Implicit(conversion) => conversion_rank_priority(conversion),
+                ArgumentConversion::Explicit(conversion) => conversion_rank_priority(conversion),
+                ArgumentConversion::Storage(conversion) => {
+                    Some(super::conversion_rank_priority(conversion.rank))
                 }
-                ArgumentConversion::Explicit(_) => Some(0),
             })
             .collect()
     }
@@ -186,13 +195,19 @@ impl ApplicationResolution {
 pub struct ApplicationResolver<'a> {
     types: &'a TypeRegistry,
     untyped_parameter: TypeRef,
+    conversions: &'a ConversionResolver<'a>,
 }
 
 impl<'a> ApplicationResolver<'a> {
-    pub const fn new(types: &'a TypeRegistry, untyped_parameter: TypeRef) -> Self {
+    pub const fn new(
+        types: &'a TypeRegistry,
+        untyped_parameter: TypeRef,
+        conversions: &'a ConversionResolver<'a>,
+    ) -> Self {
         Self {
             types,
             untyped_parameter,
+            conversions,
         }
     }
 
@@ -298,6 +313,7 @@ impl<'a> ApplicationResolver<'a> {
                     actual_index,
                     formal_index: actual_index,
                     formal_type: formal.ty,
+                    required_use: formal_semantic_use(formal.mode),
                     conversion: None,
                 });
                 continue;
@@ -310,11 +326,11 @@ impl<'a> ApplicationResolver<'a> {
                     });
                     None
                 } else {
-                    Some(ValueConversion {
+                    Some(ArgumentConversion::Storage(ValueConversion {
                         rank: super::ConversionRank::Compatible,
                         operation: super::ValueConversionOperation::UntypedStorage,
                         range_check: super::RangeCheck::None,
-                    })
+                    }))
                 }
             } else {
                 match formal.mode {
@@ -333,19 +349,32 @@ impl<'a> ApplicationResolver<'a> {
                             });
                             None
                         } else {
-                            Some(ValueConversion::identity())
+                            Some(ArgumentConversion::Storage(ValueConversion::identity()))
                         }
                     }
                     ParameterMode::Value | ParameterMode::Const | ParameterMode::ConstRef => {
-                        let conversion = self.types.value_conversion(formal.ty, actual_type);
-                        if conversion.is_none() {
-                            rejections.push(CandidateRejection::NoImplicitConversion {
-                                actual_index,
-                                destination: formal.ty,
-                                source: actual_type,
-                            });
+                        let conversion = self.conversions.resolve_implicit(formal.ty, actual_type);
+                        match &conversion.selection {
+                            ConversionSelection::Selected { .. } => {
+                                Some(ArgumentConversion::Implicit(conversion))
+                            }
+                            ConversionSelection::Ambiguous { attempts } => {
+                                rejections.push(CandidateRejection::AmbiguousConversion {
+                                    destination: formal.ty,
+                                    source: actual_type,
+                                    attempts: attempts.clone(),
+                                });
+                                None
+                            }
+                            ConversionSelection::NoViable => {
+                                rejections.push(CandidateRejection::NoImplicitConversion {
+                                    actual_index,
+                                    destination: formal.ty,
+                                    source: actual_type,
+                                });
+                                None
+                            }
                         }
-                        conversion
                     }
                 }
             };
@@ -353,7 +382,8 @@ impl<'a> ApplicationResolver<'a> {
                 actual_index,
                 formal_index: actual_index,
                 formal_type: formal.ty,
-                conversion: conversion.map(ArgumentConversion::Implicit),
+                required_use: formal_semantic_use(formal.mode),
+                conversion,
             });
         }
         let defaults = if actuals.len() <= maximum {
@@ -397,20 +427,33 @@ impl<'a> ApplicationResolver<'a> {
         }
         if let Some(actual) = actuals.first() {
             if let Some(source) = actual.ty {
-                let conversion = self
-                    .types
-                    .predefined_explicit_conversion(destination, source);
-                if conversion.is_none() {
-                    rejections.push(CandidateRejection::NoExplicitConversion {
-                        destination,
-                        source,
-                    });
-                }
+                let conversion = self.conversions.resolve_explicit(destination, source);
+                let conversion = match &conversion.selection {
+                    ConversionSelection::Selected { .. } => {
+                        Some(ArgumentConversion::Explicit(conversion))
+                    }
+                    ConversionSelection::Ambiguous { attempts } => {
+                        rejections.push(CandidateRejection::AmbiguousConversion {
+                            destination,
+                            source,
+                            attempts: attempts.clone(),
+                        });
+                        None
+                    }
+                    ConversionSelection::NoViable => {
+                        rejections.push(CandidateRejection::NoExplicitConversion {
+                            destination,
+                            source,
+                        });
+                        None
+                    }
+                };
                 arguments.push(ArgumentBinding {
                     actual_index: 0,
                     formal_index: 0,
                     formal_type: destination,
-                    conversion: conversion.map(ArgumentConversion::Explicit),
+                    required_use: SemanticUse::Value,
+                    conversion,
                 });
             } else {
                 rejections.push(CandidateRejection::MissingActualType { actual_index: 0 });
@@ -418,6 +461,7 @@ impl<'a> ApplicationResolver<'a> {
                     actual_index: 0,
                     formal_index: 0,
                     formal_type: destination,
+                    required_use: SemanticUse::Value,
                     conversion: None,
                 });
             }
@@ -471,6 +515,13 @@ fn validate_receiver(
     }
 }
 
+const fn formal_semantic_use(mode: ParameterMode) -> SemanticUse {
+    match mode {
+        ParameterMode::Var | ParameterMode::Out => SemanticUse::MutablePlace,
+        ParameterMode::Value | ParameterMode::Const | ParameterMode::ConstRef => SemanticUse::Value,
+    }
+}
+
 fn dominates(left: &CandidateAttempt, right: &CandidateAttempt) -> bool {
     let left = left.explicit_ranks();
     let right = right.explicit_ranks();
@@ -479,12 +530,21 @@ fn dominates(left: &CandidateAttempt, right: &CandidateAttempt) -> bool {
         && left.iter().zip(&right).any(|(left, right)| left < right)
 }
 
-fn conversion_rank_priority(conversion: &ValueConversion) -> u8 {
-    match conversion.rank {
-        super::ConversionRank::Exact => 0,
-        super::ConversionRank::Subtype => 1,
-        super::ConversionRank::Widening => 2,
-        super::ConversionRank::Compatible => 3,
+fn conversion_rank_priority(conversion: &ConversionResolution) -> Option<u8> {
+    match conversion.selected()? {
+        ResolvedConversion::Implicit(conversion) => {
+            Some(super::conversion_rank_priority(conversion.rank))
+        }
+        ResolvedConversion::Explicit(super::ExplicitConversion::Value(conversion)) => {
+            Some(super::conversion_rank_priority(conversion.rank))
+        }
+        ResolvedConversion::Explicit(
+            super::ExplicitConversion::IntegerTruncate { .. }
+            | super::ExplicitConversion::PointerCrossing { .. }
+            | super::ExplicitConversion::RelatedDowncast { .. }
+            | super::ExplicitConversion::RepresentationOverlay { .. }
+            | super::ExplicitConversion::CustomOperator { .. },
+        ) => Some(0),
     }
 }
 
@@ -533,6 +593,7 @@ mod tests {
     #[test]
     fn equal_viable_candidates_are_ambiguous_even_with_different_default_counts() {
         let mut types = TypeRegistry::new();
+        let scopes = super::super::ScopeGraph::new();
         let scalar = types.allocate_complete(
             TypeOwner::Builtin,
             None,
@@ -545,7 +606,13 @@ mod tests {
         );
         let first = callable(&mut types, &[(scalar, false)], None);
         let second = callable(&mut types, &[(scalar, false), (scalar, true)], None);
-        let resolution = ApplicationResolver::new(&types, TypeRef(999)).resolve(
+        let conversions = ConversionResolver::new(
+            &types,
+            &scopes,
+            scopes.current_environment(),
+            crate::ModeSnapshot::default(),
+        );
+        let resolution = ApplicationResolver::new(&types, TypeRef(999), &conversions).resolve(
             vec![
                 ApplicationCandidate::Routine {
                     symbol: SymbolId(0),

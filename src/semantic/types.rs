@@ -64,6 +64,7 @@ pub enum ConversionRank {
     Subtype,
     Widening,
     Compatible,
+    Operator,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,12 +77,18 @@ pub enum RangeCheck {
 pub enum ValueConversionOperation {
     Identity,
     IntegerWiden,
+    IntegerNarrow,
     ClassUpcast,
     InterfaceUpcast,
     StringConvert,
     ArrayConvert,
     Callable,
     UntypedStorage,
+    CustomOperator {
+        symbol: SymbolId,
+        callable_type: TypeRef,
+        input: Box<ValueConversion>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,6 +128,11 @@ pub enum ExplicitConversion {
         source: TypeRef,
         size: u64,
         writable_requires_addressable_source: bool,
+    },
+    CustomOperator {
+        symbol: SymbolId,
+        callable_type: TypeRef,
+        input: ValueConversion,
     },
 }
 
@@ -658,6 +670,13 @@ impl PascalType for PrimitiveType {
                         rank: ConversionRank::Widening,
                         operation: ValueConversionOperation::IntegerWiden,
                         range_check: RangeCheck::None,
+                    })
+                }
+                (PrimitiveKind::Integer { .. }, PrimitiveKind::Integer { .. }) => {
+                    Some(ValueConversion {
+                        rank: ConversionRank::Compatible,
+                        operation: ValueConversionOperation::IntegerNarrow,
+                        range_check: RangeCheck::TargetPolicy,
                     })
                 }
                 _ => None,

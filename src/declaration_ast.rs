@@ -131,6 +131,13 @@ pub struct ValueDeclarationSyntax {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PropertyDeclarationSyntax {
+    pub value: ValueDeclarationSyntax,
+    pub readable: bool,
+    pub writable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutineDeclarationSyntax {
     pub kind: RoutineSyntaxKind,
     pub name: SpannedName,
@@ -159,7 +166,7 @@ pub enum DeclarationSyntax {
     Variables(ValueDeclarationSyntax),
     Constants(ValueDeclarationSyntax),
     Routine(RoutineDeclarationSyntax),
-    Property(ValueDeclarationSyntax),
+    Property(PropertyDeclarationSyntax),
     Labels {
         names: Vec<SpannedName>,
         span: Span,
@@ -180,9 +187,8 @@ impl DeclarationSyntax {
             | Self::TypeSection { span, .. }
             | Self::Labels { span, .. }
             | Self::Unsupported { span, .. } => span.clone(),
-            Self::Variables(declaration)
-            | Self::Constants(declaration)
-            | Self::Property(declaration) => declaration.span.clone(),
+            Self::Variables(declaration) | Self::Constants(declaration) => declaration.span.clone(),
+            Self::Property(declaration) => declaration.value.span.clone(),
             Self::Routine(declaration) => declaration.span.clone(),
             Self::Visibility { name } => name.span.clone(),
         }

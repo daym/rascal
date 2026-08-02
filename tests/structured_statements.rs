@@ -195,16 +195,12 @@ fn structured_statements_bind_recursively_with_scopes_and_types() {
         let BoundStatementKind::Assignment(assignment) = &with_body.kind else {
             return false;
         };
-        let rascal::semantic::BoundExpressionKind::Application { operands, .. } = &assignment.kind
-        else {
-            return false;
-        };
         matches!(
-            operands.first().map(|operand| &operand.kind),
-            Some(rascal::semantic::BoundExpressionKind::Symbol {
+            &assignment.target.kind,
+            rascal::semantic::BoundExpressionKind::Symbol {
                 receiver: Some(_),
                 ..
-            })
+            }
         )
     });
     assert!(
@@ -305,16 +301,12 @@ fn inline_variables_follow_source_order_and_nested_block_scope() {
     let BoundStatementKind::Assignment(assignment) = &inner_block[3].kind else {
         panic!("expected assignment after the redeclaration")
     };
-    let rascal::semantic::BoundExpressionKind::Application { operands, .. } = &assignment.kind
-    else {
-        panic!("expected a bound assignment application")
-    };
     assert!(matches!(
-        operands.get(1).map(|operand| &operand.kind),
-        Some(rascal::semantic::BoundExpressionKind::Symbol {
+        &assignment.source.kind,
+        rascal::semantic::BoundExpressionKind::Symbol {
             symbol,
             receiver: None,
-        }) if *symbol == second_inner
+        } if *symbol == second_inner
     ));
 
     let leaking = "

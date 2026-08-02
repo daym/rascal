@@ -1,6 +1,43 @@
 use crate::{ForDirection, Literal, ModeSnapshot, Operator, Span};
 
-use super::{ApplicationResolution, EnvironmentId, ReceiverId, SymbolId, TypeRef};
+use super::{
+    ApplicationResolution, ConversionResolution, EnvironmentId, ReceiverId, SymbolId, TypeRef,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SemanticUse {
+    Value,
+    MutablePlace,
+    AssignmentTarget,
+    Condition,
+    Address,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpressionCategory {
+    Storage { mutable: bool },
+    Property { readable: bool, writable: bool },
+    Value,
+    Temporary,
+    Error,
+}
+
+impl ExpressionCategory {
+    pub const fn is_addressable(self) -> bool {
+        matches!(self, Self::Storage { .. })
+    }
+
+    pub const fn is_mutable_storage(self) -> bool {
+        matches!(self, Self::Storage { mutable: true })
+    }
+
+    pub const fn is_assignment_target(self) -> bool {
+        matches!(
+            self,
+            Self::Storage { mutable: true } | Self::Property { writable: true, .. }
+        )
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundBody {
@@ -19,7 +56,7 @@ pub struct BoundStatement {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoundStatementKind {
     Expression(BoundExpression),
-    Assignment(BoundExpression),
+    Assignment(BoundAssignment),
     Compound(Vec<BoundStatement>),
     If {
         condition: BoundExpression,
@@ -45,6 +82,7 @@ pub enum BoundStatementKind {
     ForIn {
         control: Option<SymbolId>,
         source: BoundExpression,
+        element_conversion: Option<ConversionResolution>,
         body: Box<BoundStatement>,
         modes: ModeSnapshot,
     },
@@ -86,6 +124,14 @@ pub enum BoundStatementKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundAssignment {
+    pub target: BoundExpression,
+    pub source: BoundExpression,
+    pub conversion: Option<ConversionResolution>,
+    pub modes: ModeSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundCaseArm {
     pub labels: Vec<BoundCaseLabel>,
     pub statement: BoundStatement,
@@ -122,6 +168,9 @@ pub struct BoundExceptionHandler {
 pub struct BoundExpression {
     pub kind: BoundExpressionKind,
     pub ty: Option<TypeRef>,
+    pub category: ExpressionCategory,
+    pub semantic_use: SemanticUse,
+    pub conversion: Option<ConversionResolution>,
     pub span: Span,
 }
 

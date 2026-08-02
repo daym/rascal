@@ -180,15 +180,7 @@ fn methods_procedural_values_properties_operators_and_conversions_share_resoluti
     let BoundStatementKind::Assignment(assignment) = &body.statements[3].kind else {
         panic!("expected assignment")
     };
-    let BoundExpressionKind::Application {
-        target: BoundApplicationTarget::Operator { resolution, .. },
-        operands,
-        ..
-    } = &assignment.kind
-    else {
-        panic!("expected assignment operator resolution")
-    };
-    assert!(resolution.selected_attempt().is_some());
+    assert!(assignment.conversion.as_ref().unwrap().selected().is_some());
     let BoundExpressionKind::Application {
         target:
             BoundApplicationTarget::Conversion {
@@ -197,7 +189,7 @@ fn methods_procedural_values_properties_operators_and_conversions_share_resoluti
             },
         operands: converted,
         ..
-    } = &operands[1].kind
+    } = &assignment.source.kind
     else {
         panic!("expected direct conversion resolution")
     };

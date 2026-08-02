@@ -1,6 +1,7 @@
 pub mod application;
 pub mod binder;
 pub mod constants;
+pub mod conversion;
 pub mod expressions;
 pub mod frontend;
 pub mod ids;
@@ -20,10 +21,15 @@ pub use binder::{
 pub use constants::{
     ConstantEntry, ConstantEvaluationError, ConstantEvaluator, ConstantRegistry, ConstantValue,
 };
+pub use conversion::{
+    ConversionAttempt, ConversionCandidate, ConversionMode, ConversionRejection,
+    ConversionResolution, ConversionResolver, ConversionSelection, CustomConversionKind,
+    ResolvedConversion, conversion_rank_priority,
+};
 pub use expressions::{
-    BoundApplicationTarget, BoundBody, BoundCaseArm, BoundCaseLabel, BoundExceptionHandler,
-    BoundExpression, BoundExpressionKind, BoundSetElement, BoundStatement, BoundStatementKind,
-    BoundTryContinuation,
+    BoundApplicationTarget, BoundAssignment, BoundBody, BoundCaseArm, BoundCaseLabel,
+    BoundExceptionHandler, BoundExpression, BoundExpressionKind, BoundSetElement, BoundStatement,
+    BoundStatementKind, BoundTryContinuation, ExpressionCategory, SemanticUse,
 };
 pub use frontend::{BoundFile, SemanticCompilation, bind_sources};
 pub use ids::{
@@ -36,7 +42,8 @@ pub use modules::{
 pub use scope::{
     DeclarationMode, DeclarationState, DeclareError, EnvironmentCheckpoint, FrameKind,
     LookupBarrier, LookupEdge, LookupEdgeKind, LookupHit, LookupRequest, LookupResult, LookupStep,
-    NameInterner, RegionOwner, ScopeGraph, Symbol, SymbolCategory, SymbolFilter, SymbolKind,
+    NameInterner, PropertySymbol, RegionOwner, ScopeGraph, Symbol, SymbolCategory, SymbolFilter,
+    SymbolKind,
 };
 pub use types::{
     AccessKind, AggregateShape, AliasType, ArrayType, CallableFlavor, CallableType,

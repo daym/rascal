@@ -204,6 +204,14 @@ pub enum BoundExpressionKind {
         base: Box<BoundExpression>,
         symbol: SymbolId,
     },
+    TypeIdentifier {
+        symbol: SymbolId,
+        instance_type: TypeRef,
+    },
+    Inherited {
+        symbols: Vec<SymbolId>,
+        forward_parameters: bool,
+    },
     Property {
         base: Option<Box<BoundExpression>>,
         lookup_receiver: Option<ReceiverId>,

@@ -10,6 +10,8 @@ pub enum ApplicationReceiver {
     Lookup(ReceiverId),
     Explicit,
     ImplicitSelf,
+    ClassIdentifier(TypeRef),
+    Inherited,
     StaticLink,
     CallableValue { lookup_receiver: Option<ReceiverId> },
 }
@@ -501,6 +503,18 @@ fn validate_receiver(
                     ApplicationReceiver::Lookup(_)
                         | ApplicationReceiver::Explicit
                         | ApplicationReceiver::ImplicitSelf
+                        | ApplicationReceiver::Inherited
+                ) {
+                    rejections.push(CandidateRejection::MissingReceiver { callable_type });
+                }
+            }
+            CallableFlavor::ClassMethod => {
+                if !matches!(
+                    receiver,
+                    ApplicationReceiver::ClassIdentifier(_)
+                        | ApplicationReceiver::Explicit
+                        | ApplicationReceiver::ImplicitSelf
+                        | ApplicationReceiver::Inherited
                 ) {
                     rejections.push(CandidateRejection::MissingReceiver { callable_type });
                 }
@@ -590,6 +604,8 @@ mod tests {
                 captures: Vec::new(),
                 environment: EnvironmentRequirement::None,
                 has_body: false,
+                method: None,
+                overload: false,
             },
         )
     }

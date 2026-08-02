@@ -828,6 +828,34 @@ fn routine_name(tokens: &[Token], kind: RoutineSyntaxKind) -> Option<SpannedName
     })
 }
 
+fn routine_qualifier(tokens: &[Token], kind: RoutineSyntaxKind) -> Vec<SpannedName> {
+    if kind == RoutineSyntaxKind::Operator {
+        return Vec::new();
+    }
+    let header_end = first_semicolon(tokens, 0).min(tokens.len());
+    let end = tokens[1..header_end]
+        .iter()
+        .position(|token| {
+            matches!(
+                token.kind,
+                TokenKind::LeftParen | TokenKind::Colon | TokenKind::Semicolon
+            )
+        })
+        .map_or(header_end, |offset| offset + 1);
+    let mut names = tokens[1..end]
+        .iter()
+        .filter_map(|token| match &token.kind {
+            TokenKind::Identifier(spelling) => Some(SpannedName {
+                spelling: spelling.clone(),
+                span: token.span.clone(),
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    names.pop();
+    names
+}
+
 fn formal_mode(token: &Token) -> Option<FormalModeSyntax> {
     [
         ("const", FormalModeSyntax::Const),
@@ -1011,6 +1039,7 @@ fn is_declaration_start(token: &Token) -> bool {
                     | "constructor"
                     | "destructor"
                     | "operator"
+                    | "class"
             )
     )
 }
@@ -1076,9 +1105,8 @@ impl<'a> DeclarationScanner<'a> {
             } else if is_keyword(&self.tokens[self.index], "label") {
                 declarations.push(self.parse_labels());
             } else if routine_kind(&self.tokens[self.index]).is_some() {
-                declarations.push(self.parse_routine());
-            } else if self.members
-                && is_keyword(&self.tokens[self.index], "class")
+                declarations.push(self.parse_routine(false));
+            } else if is_keyword(&self.tokens[self.index], "class")
                 && self
                     .tokens
                     .get(self.index + 1)
@@ -1086,7 +1114,7 @@ impl<'a> DeclarationScanner<'a> {
                     .is_some()
             {
                 self.index += 1;
-                declarations.push(self.parse_routine());
+                declarations.push(self.parse_routine(true));
             } else if self.members
                 && ["private", "protected", "public", "published", "strict"]
                     .iter()
@@ -1204,18 +1232,37 @@ impl<'a> DeclarationScanner<'a> {
         }
     }
 
-    fn parse_routine(&mut self) -> DeclarationSyntax {
+    fn parse_routine(&mut self, class_method: bool) -> DeclarationSyntax {
         let start = self.index;
         let kind = routine_kind(&self.tokens[start]).expect("caller checked routine keyword");
         let header_end = first_semicolon(self.tokens, start);
         let mut cursor = (header_end + 1).min(self.tokens.len());
         let mut is_forward = false;
         let mut overload = kind == RoutineSyntaxKind::Operator;
+        let mut static_method = false;
+        let mut virtual_method = false;
+        let mut override_method = false;
+        let mut abstract_method = false;
+        let mut final_method = false;
+        let mut reintroduce = false;
         let mut calling_convention = CallingConventionSyntax::Pascal;
         while cursor < self.tokens.len()
             && [
-                "forward", "external", "overload", "inline", "cdecl", "stdcall", "register",
+                "forward",
+                "external",
+                "overload",
+                "inline",
+                "cdecl",
+                "stdcall",
+                "register",
                 "pascal",
+                "virtual",
+                "dynamic",
+                "override",
+                "abstract",
+                "static",
+                "final",
+                "reintroduce",
             ]
             .iter()
             .any(|word| is_keyword(&self.tokens[cursor], word))
@@ -1223,6 +1270,14 @@ impl<'a> DeclarationScanner<'a> {
             is_forward |= is_keyword(&self.tokens[cursor], "forward")
                 || is_keyword(&self.tokens[cursor], "external");
             overload |= is_keyword(&self.tokens[cursor], "overload");
+            static_method |= is_keyword(&self.tokens[cursor], "static");
+            virtual_method |= is_keyword(&self.tokens[cursor], "virtual")
+                || is_keyword(&self.tokens[cursor], "dynamic");
+            override_method |= is_keyword(&self.tokens[cursor], "override");
+            abstract_method |= is_keyword(&self.tokens[cursor], "abstract");
+            final_method |= is_keyword(&self.tokens[cursor], "final");
+            reintroduce |= is_keyword(&self.tokens[cursor], "reintroduce");
+            is_forward |= abstract_method;
             calling_convention = if is_keyword(&self.tokens[cursor], "cdecl") {
                 CallingConventionSyntax::Cdecl
             } else if is_keyword(&self.tokens[cursor], "stdcall") {
@@ -1267,11 +1322,16 @@ impl<'a> DeclarationScanner<'a> {
             spelling: "<missing>".to_owned(),
             span: self.tokens[start].span.clone(),
         });
+        let qualifier = routine_qualifier(
+            &self.tokens[start..=header_end.min(self.tokens.len() - 1)],
+            kind,
+        );
         let (parameters, result) =
             routine_signature_syntax(&self.tokens[start..=header_end.min(self.tokens.len() - 1)]);
         self.index = end;
         DeclarationSyntax::Routine(RoutineDeclarationSyntax {
             kind,
+            qualifier,
             name,
             parameters,
             result,
@@ -1280,6 +1340,13 @@ impl<'a> DeclarationScanner<'a> {
             has_body,
             is_forward,
             overload,
+            class_method,
+            static_method,
+            virtual_method,
+            override_method,
+            abstract_method,
+            final_method,
+            reintroduce,
             calling_convention,
             span: token_span(&self.tokens[start..end], self.tokens[start].span.start),
             modes: self.tokens[start].modes,

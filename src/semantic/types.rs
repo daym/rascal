@@ -663,6 +663,71 @@ impl TypeRegistry {
             .downcast_ref::<CallableType>()
     }
 
+    pub fn set_callable_method(
+        &mut self,
+        ty: TypeRef,
+        flavor: CallableFlavor,
+        method: MethodMetadata,
+    ) -> Result<(), TypeRegistryError> {
+        let Some(callable) = self
+            .implementation_mut(ty)
+            .and_then(|implementation| implementation.as_any_mut().downcast_mut::<CallableType>())
+        else {
+            return Err(TypeRegistryError::NotCallable(ty));
+        };
+        callable.flavor = flavor;
+        callable.method = Some(method);
+        Ok(())
+    }
+
+    pub fn signatures_equivalent(&self, left: TypeRef, right: &RoutineSignature) -> bool {
+        self.callable(left)
+            .is_some_and(|callable| callable.signature_equivalent(self.query(left), right))
+    }
+
+    pub fn virtual_slot_count(&self, ty: TypeRef) -> u32 {
+        let (methods, base) = if let Some(class) = self
+            .implementation(ty)
+            .and_then(|implementation| implementation.as_any().downcast_ref::<ClassType>())
+        {
+            (&class.methods, class.base)
+        } else if let Some(object) = self
+            .implementation(ty)
+            .and_then(|implementation| implementation.as_any().downcast_ref::<ObjectType>())
+        {
+            (&object.methods, object.base)
+        } else {
+            return 0;
+        };
+        let inherited = base.map_or(0, |base| self.virtual_slot_count(base));
+        let own = methods
+            .iter()
+            .filter_map(|method| {
+                self.callable(*method)
+                    .and_then(|callable| callable.method)
+                    .and_then(MethodMetadata::virtual_slot)
+            })
+            .max()
+            .map_or(0, |slot| slot.saturating_add(1));
+        inherited.max(own)
+    }
+
+    pub fn base_type(&self, ty: TypeRef) -> Option<TypeRef> {
+        let implementation = self.implementation(ty)?;
+        if let Some(class) = implementation.as_any().downcast_ref::<ClassType>() {
+            return class.base;
+        }
+        implementation
+            .as_any()
+            .downcast_ref::<ObjectType>()
+            .and_then(|object| object.base)
+    }
+
+    pub fn is_class_type(&self, ty: TypeRef) -> bool {
+        self.implementation(self.canonical_type(ty))
+            .is_some_and(|implementation| implementation.as_any().is::<ClassType>())
+    }
+
     pub fn set_enum_members(
         &mut self,
         ty: TypeRef,
@@ -1806,7 +1871,47 @@ pub struct RoutineSignature {
 pub enum CallableFlavor {
     Routine,
     Method,
+    ClassMethod,
     Nested,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MethodDispatch {
+    NonVirtual,
+    Static,
+    Virtual {
+        slot: u32,
+        overridden: Option<SymbolId>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MethodMetadata {
+    pub dispatch: MethodDispatch,
+    pub ancestor: Option<SymbolId>,
+    pub abstract_method: bool,
+    pub final_method: bool,
+    pub reintroduce: bool,
+}
+
+impl MethodMetadata {
+    pub const fn virtual_slot(self) -> Option<u32> {
+        match self.dispatch {
+            MethodDispatch::Virtual { slot, .. } => Some(slot),
+            MethodDispatch::NonVirtual | MethodDispatch::Static => None,
+        }
+    }
+
+    pub const fn overridden(self) -> Option<SymbolId> {
+        match self.dispatch {
+            MethodDispatch::Virtual { overridden, .. } => overridden,
+            MethodDispatch::NonVirtual | MethodDispatch::Static => None,
+        }
+    }
+
+    pub const fn ancestor(self) -> Option<SymbolId> {
+        self.ancestor
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1839,25 +1944,31 @@ pub struct CallableType {
     pub captures: Vec<Capture>,
     pub environment: EnvironmentRequirement,
     pub has_body: bool,
+    pub method: Option<MethodMetadata>,
+    pub overload: bool,
 }
 
 impl CallableType {
-    fn compatible_signature(&self, query: TypeQuery<'_>, other: &Self) -> bool {
-        self.signature.calling_convention == other.signature.calling_convention
-            && self.signature.parameters.len() == other.signature.parameters.len()
+    pub fn signature_equivalent(&self, query: TypeQuery<'_>, other: &RoutineSignature) -> bool {
+        self.signature.calling_convention == other.calling_convention
+            && self.signature.parameters.len() == other.parameters.len()
             && self
                 .signature
                 .parameters
                 .iter()
-                .zip(&other.signature.parameters)
+                .zip(&other.parameters)
                 .all(|(left, right)| {
                     left.mode == right.mode && query.types.same_formal_contract(left.ty, right.ty)
                 })
-            && match (self.signature.result, other.signature.result) {
+            && match (self.signature.result, other.result) {
                 (Some(left), Some(right)) => query.types.same_formal_contract(left, right),
                 (None, None) => true,
                 _ => false,
             }
+    }
+
+    fn compatible_signature(&self, query: TypeQuery<'_>, other: &Self) -> bool {
+        self.signature_equivalent(query, &other.signature)
     }
 
     fn explicit_adapter_compatible(&self, query: TypeQuery<'_>, source: &Self) -> bool {
@@ -2563,9 +2674,10 @@ impl PascalType for ArrayType {
 
 pub const fn symbol_category_for_callable(flavor: CallableFlavor) -> SymbolCategory {
     match flavor {
-        CallableFlavor::Routine | CallableFlavor::Method | CallableFlavor::Nested => {
-            SymbolCategory::Routine
-        }
+        CallableFlavor::Routine
+        | CallableFlavor::Method
+        | CallableFlavor::ClassMethod
+        | CallableFlavor::Nested => SymbolCategory::Routine,
     }
 }
 
@@ -2618,6 +2730,8 @@ mod tests {
                 captures: Vec::new(),
                 environment: EnvironmentRequirement::None,
                 has_body: false,
+                method: None,
+                overload: false,
             },
         )
     }

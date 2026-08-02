@@ -145,6 +145,7 @@ pub struct PropertyDeclarationSyntax {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutineDeclarationSyntax {
     pub kind: RoutineSyntaxKind,
+    pub qualifier: Vec<SpannedName>,
     pub name: SpannedName,
     pub parameters: Vec<FormalParameterSyntax>,
     pub result: Option<TypeSyntax>,
@@ -153,6 +154,13 @@ pub struct RoutineDeclarationSyntax {
     pub has_body: bool,
     pub is_forward: bool,
     pub overload: bool,
+    pub class_method: bool,
+    pub static_method: bool,
+    pub virtual_method: bool,
+    pub override_method: bool,
+    pub abstract_method: bool,
+    pub final_method: bool,
+    pub reintroduce: bool,
     pub calling_convention: CallingConventionSyntax,
     pub span: Span,
     pub modes: ModeSnapshot,

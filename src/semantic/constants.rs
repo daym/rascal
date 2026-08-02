@@ -212,6 +212,8 @@ impl<'a> ConstantEvaluator<'a> {
                 })
             }
             BoundExpressionKind::Member { .. }
+            | BoundExpressionKind::TypeIdentifier { .. }
+            | BoundExpressionKind::Inherited { .. }
             | BoundExpressionKind::Property { .. }
             | BoundExpressionKind::RoutineDesignator { .. }
             | BoundExpressionKind::ProcedureCode(_)

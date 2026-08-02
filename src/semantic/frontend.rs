@@ -26,12 +26,13 @@ use super::{
     ConversionSelection, DeclarationMode, DeclarationState, DeclaredRoutine, EnumMember, EnumType,
     EnvironmentId, EnvironmentRequirement, ExpressionCategory, FieldLayout, FormalParameter,
     FrameKind, IncompleteReason, LookupBarrier, LookupEdge, LookupRequest, LookupResult,
-    ModuleGraphError, ModuleId, ModulePhase, ModuleRegistry, NameId, NilType, NodeId, OpaqueType,
-    OrdinalDomain, ParameterMode, PointerType, PrimitiveKind, PrimitiveType, PropertyAccessKind,
-    PropertyAccessor, PropertySymbol, RawMethodType, ReceiverId, RegionOwner, RoutineOwner,
-    RoutineSignature, SemanticBinder, SemanticUse, SetType, StorageLayout, StringKind,
-    StringLiteralType, StringType, SubrangeType, SymbolCategory, SymbolFilter, SymbolId,
-    SymbolKind, TypeOwner, TypeRef, UnitType, UntypedPointerType, VariantAlternative, VariantPart,
+    MethodDispatch, MethodMetadata, ModuleGraphError, ModuleId, ModulePhase, ModuleRegistry,
+    NameId, NilType, NodeId, OpaqueType, OrdinalDomain, ParameterMode, PointerType, PrimitiveKind,
+    PrimitiveType, PropertyAccessKind, PropertyAccessor, PropertySymbol, RawMethodType, ReceiverId,
+    RegionOwner, RoutineOwner, RoutineSignature, SemanticBinder, SemanticUse, SetType,
+    StorageLayout, StringKind, StringLiteralType, StringType, SubrangeType, SymbolCategory,
+    SymbolFilter, SymbolId, SymbolKind, TypeOwner, TypeRef, UnitType, UntypedPointerType,
+    VariantAlternative, VariantPart,
 };
 
 #[derive(Clone, Debug)]
@@ -77,6 +78,12 @@ struct ResolvedParameter {
     ty: TypeRef,
 }
 
+#[derive(Clone, Debug)]
+struct ActiveRoutine {
+    ty: TypeRef,
+    parameters: Vec<SymbolId>,
+}
+
 struct CompilationDriver {
     binder: SemanticBinder,
     modules: ModuleRegistry,
@@ -91,6 +98,7 @@ struct CompilationDriver {
     next_receiver: usize,
     next_block: u32,
     loop_depth: u32,
+    active_routines: Vec<ActiveRoutine>,
 }
 
 impl CompilationDriver {
@@ -121,6 +129,7 @@ impl CompilationDriver {
             next_receiver: 0,
             next_block: 0,
             loop_depth: 0,
+            active_routines: Vec::new(),
         }
     }
 
@@ -471,6 +480,8 @@ impl CompilationDriver {
                     captures: Vec::new(),
                     environment: EnvironmentRequirement::None,
                     has_body: false,
+                    method: None,
+                    overload: false,
                 };
                 if let Err(error) = self.binder.define_type(name, implementation) {
                     self.bind_error(declaration.span.clone(), error);
@@ -1174,6 +1185,8 @@ impl CompilationDriver {
             captures: Vec::new(),
             environment: EnvironmentRequirement::None,
             has_body: false,
+            method: None,
+            overload: false,
         };
         let read_contract = read
             .as_ref()
@@ -1257,12 +1270,21 @@ impl CompilationDriver {
         let Some(name) = self.routine_name_id(routine, &signature) else {
             return;
         };
+        let flavor = if routine.class_method {
+            CallableFlavor::ClassMethod
+        } else {
+            CallableFlavor::Method
+        };
+        let inherited = self.inherited_method_matches(aggregate, name, &signature, flavor);
+        let metadata = self.method_metadata(routine, aggregate, &inherited);
         let result = signature.result;
         let method = match self.binder.declare_method(
             aggregate,
             name,
             signature,
             routine_declaration_mode(routine),
+            flavor,
+            metadata,
         ) {
             Ok(method) => method,
             Err(error) => {
@@ -1281,6 +1303,10 @@ impl CompilationDriver {
             return;
         };
         let result = signature.result;
+        if !routine.qualifier.is_empty() {
+            self.bind_qualified_method_implementation(routine, signature, parameters, name, result);
+            return;
+        }
         let region = self
             .binder
             .scopes
@@ -1313,6 +1339,264 @@ impl CompilationDriver {
         }
     }
 
+    fn inherited_method_matches(
+        &self,
+        aggregate: &AggregateDefinition,
+        name: NameId,
+        signature: &RoutineSignature,
+        flavor: CallableFlavor,
+    ) -> Vec<(SymbolId, TypeRef, MethodMetadata)> {
+        let Some(environment) = SemanticBinder::inherited_environment(aggregate) else {
+            return Vec::new();
+        };
+        let Some(lookup) =
+            self.binder
+                .scopes
+                .lookup_symbol(environment, name, LookupRequest::ORDINARY)
+        else {
+            return Vec::new();
+        };
+        let mut seen = BTreeSet::new();
+        lookup
+            .primary
+            .iter()
+            .chain(lookup.shadowed.iter().flatten())
+            .filter_map(|hit| {
+                if !seen.insert(hit.symbol) {
+                    return None;
+                }
+                let SymbolKind::Routine(callable_type) = self.binder.scopes.symbol(hit.symbol).kind
+                else {
+                    return None;
+                };
+                let callable = self.binder.types.callable(callable_type)?;
+                let metadata = callable.method?;
+                (callable.flavor == flavor
+                    && callable
+                        .signature_equivalent(self.binder.types.query(callable_type), signature))
+                .then_some((hit.symbol, callable_type, metadata))
+            })
+            .collect()
+    }
+
+    fn method_metadata(
+        &mut self,
+        routine: &RoutineDeclarationSyntax,
+        aggregate: &mut AggregateDefinition,
+        inherited: &[(SymbolId, TypeRef, MethodMetadata)],
+    ) -> MethodMetadata {
+        let next_slot = |aggregate: &mut AggregateDefinition| {
+            let slot = aggregate.next_virtual_slot;
+            aggregate.next_virtual_slot = aggregate.next_virtual_slot.saturating_add(1);
+            slot
+        };
+        let virtual_ancestor = inherited
+            .iter()
+            .find(|(_, _, metadata)| metadata.virtual_slot().is_some())
+            .copied();
+        let exact_ancestor = inherited.first().map(|(symbol, _, _)| *symbol);
+        let dispatch = match aggregate.kind {
+            AggregateKind::Class { .. } => {
+                if routine.static_method {
+                    if routine.virtual_method || routine.override_method {
+                        self.diagnostics.push(Diagnostic::new(
+                            routine.span.clone(),
+                            "a static class method cannot be virtual or override",
+                        ));
+                    }
+                    MethodDispatch::Static
+                } else if routine.override_method {
+                    match virtual_ancestor {
+                        Some((symbol, _, metadata)) => {
+                            if metadata.final_method {
+                                self.diagnostics.push(Diagnostic::new(
+                                    routine.span.clone(),
+                                    "cannot override a final method",
+                                ));
+                            }
+                            MethodDispatch::Virtual {
+                                slot: metadata.virtual_slot().unwrap(),
+                                overridden: Some(symbol),
+                            }
+                        }
+                        None => {
+                            self.diagnostics.push(Diagnostic::new(
+                                routine.span.clone(),
+                                "override has no matching inherited virtual method",
+                            ));
+                            MethodDispatch::Virtual {
+                                slot: next_slot(aggregate),
+                                overridden: None,
+                            }
+                        }
+                    }
+                } else if routine.virtual_method {
+                    if virtual_ancestor.is_some() {
+                        self.diagnostics.push(Diagnostic::new(
+                            routine.span.clone(),
+                            "a matching inherited virtual method must use `override`",
+                        ));
+                    }
+                    MethodDispatch::Virtual {
+                        slot: next_slot(aggregate),
+                        overridden: None,
+                    }
+                } else {
+                    if virtual_ancestor.is_some() {
+                        self.diagnostics.push(Diagnostic::new(
+                            routine.span.clone(),
+                            "a matching inherited virtual method must use `override`",
+                        ));
+                    }
+                    MethodDispatch::NonVirtual
+                }
+            }
+            AggregateKind::Object { .. } => {
+                if routine.class_method
+                    || routine.static_method
+                    || routine.override_method
+                    || routine.abstract_method
+                    || routine.final_method
+                    || routine.reintroduce
+                {
+                    self.diagnostics.push(Diagnostic::new(
+                        routine.span.clone(),
+                        "old-style object methods support only the `virtual` dispatch modifier",
+                    ));
+                }
+                if routine.virtual_method {
+                    match virtual_ancestor {
+                        Some((symbol, _, metadata)) => MethodDispatch::Virtual {
+                            slot: metadata.virtual_slot().unwrap(),
+                            overridden: Some(symbol),
+                        },
+                        None => MethodDispatch::Virtual {
+                            slot: next_slot(aggregate),
+                            overridden: None,
+                        },
+                    }
+                } else {
+                    if virtual_ancestor.is_some() {
+                        self.diagnostics.push(Diagnostic::new(
+                            routine.span.clone(),
+                            "a matching inherited virtual object method must be declared `virtual`",
+                        ));
+                    }
+                    MethodDispatch::NonVirtual
+                }
+            }
+            AggregateKind::Interface { .. } => MethodDispatch::Virtual {
+                slot: virtual_ancestor
+                    .and_then(|(_, _, metadata)| metadata.virtual_slot())
+                    .unwrap_or_else(|| next_slot(aggregate)),
+                overridden: virtual_ancestor.map(|(symbol, _, _)| symbol),
+            },
+            AggregateKind::RegularRecord | AggregateKind::PackedRecord => {
+                if routine.virtual_method || routine.override_method || routine.abstract_method {
+                    self.diagnostics.push(Diagnostic::new(
+                        routine.span.clone(),
+                        "record methods cannot be virtual, abstract, or override",
+                    ));
+                }
+                if routine.static_method || routine.class_method {
+                    MethodDispatch::Static
+                } else {
+                    MethodDispatch::NonVirtual
+                }
+            }
+        };
+        MethodMetadata {
+            dispatch,
+            ancestor: exact_ancestor,
+            abstract_method: routine.abstract_method
+                || matches!(aggregate.kind, AggregateKind::Interface { .. }),
+            final_method: routine.final_method,
+            reintroduce: routine.reintroduce,
+        }
+    }
+
+    fn bind_qualified_method_implementation(
+        &mut self,
+        routine: &RoutineDeclarationSyntax,
+        signature: RoutineSignature,
+        parameters: Vec<ResolvedParameter>,
+        name: NameId,
+        result: Option<TypeRef>,
+    ) {
+        let Some(owner) = self.resolve_named_type(&routine.qualifier, routine.span.clone()) else {
+            return;
+        };
+        let Some(environment) = self.binder.types.member_environment(owner) else {
+            self.diagnostics.push(Diagnostic::new(
+                routine.span.clone(),
+                "qualified routine owner has no member environment",
+            ));
+            return;
+        };
+        let Some(lookup) =
+            self.binder
+                .scopes
+                .lookup_symbol(environment, name, LookupRequest::ORDINARY)
+        else {
+            self.diagnostics.push(Diagnostic::new(
+                routine.span.clone(),
+                "qualified implementation has no matching member declaration",
+            ));
+            return;
+        };
+        let expected_flavor = if routine.class_method {
+            CallableFlavor::ClassMethod
+        } else {
+            CallableFlavor::Method
+        };
+        let matches = lookup
+            .primary
+            .iter()
+            .filter_map(|hit| {
+                let SymbolKind::Routine(callable_type) = self.binder.scopes.symbol(hit.symbol).kind
+                else {
+                    return None;
+                };
+                let callable = self.binder.types.callable(callable_type)?;
+                (callable.owner == RoutineOwner::Type(owner)
+                    && callable.flavor == expected_flavor
+                    && callable
+                        .signature_equivalent(self.binder.types.query(callable_type), &signature))
+                .then_some(DeclaredRoutine {
+                    symbol: hit.symbol,
+                    ty: callable_type,
+                    lexical_parent_environment: self.binder.scopes.symbol(hit.symbol).declared_in,
+                })
+            })
+            .collect::<Vec<_>>();
+        let [declared] = matches.as_slice() else {
+            self.diagnostics.push(Diagnostic::new(
+                routine.span.clone(),
+                if matches.is_empty() {
+                    "qualified implementation has no exact member signature"
+                } else {
+                    "qualified implementation matches more than one member declaration"
+                },
+            ));
+            return;
+        };
+        if self
+            .binder
+            .types
+            .callable(declared.ty)
+            .is_some_and(|callable| callable.has_body)
+        {
+            self.diagnostics.push(Diagnostic::new(
+                routine.span.clone(),
+                "member declaration already has an implementation body",
+            ));
+            return;
+        }
+        if routine.has_body {
+            self.bind_routine_body(routine, *declared, &parameters, result);
+        }
+    }
+
     fn bind_routine_body(
         &mut self,
         routine: &RoutineDeclarationSyntax,
@@ -1328,14 +1612,16 @@ impl CompilationDriver {
             }
         };
         self.binder.scopes.extend_environment(FrameKind::VarSection);
+        let mut parameter_symbols = Vec::new();
         for parameter in parameters {
-            if let Err(error) = self.binder.scopes.declare(
+            match self.binder.scopes.declare(
                 parameter.name,
                 SymbolKind::Variable(parameter.ty),
                 DeclarationState::Complete,
                 DeclarationMode::Fresh,
             ) {
-                self.bind_error(routine.span.clone(), error.into());
+                Ok(symbol) => parameter_symbols.push(symbol),
+                Err(error) => self.bind_error(routine.span.clone(), error.into()),
             }
         }
         if let Some(result) = result {
@@ -1374,7 +1660,12 @@ impl CompilationDriver {
             RoutineOwner::Routine(declared.ty),
             None,
         );
+        self.active_routines.push(ActiveRoutine {
+            ty: declared.ty,
+            parameters: parameter_symbols,
+        });
         self.bind_body_tokens(Some(declared.ty), &routine.body_tokens);
+        self.active_routines.pop();
         self.binder.end_routine_body(checkpoint);
     }
 
@@ -2259,6 +2550,36 @@ impl CompilationDriver {
         if matches!(expression.kind, BoundExpressionKind::Application { .. }) {
             return expression;
         }
+        let forwarded_operands = match &expression.kind {
+            BoundExpressionKind::Inherited {
+                forward_parameters: true,
+                ..
+            } => self
+                .active_routines
+                .last()
+                .map(|active| {
+                    active
+                        .parameters
+                        .iter()
+                        .map(|symbol| {
+                            let kind = self.binder.scopes.symbol(*symbol).kind.clone();
+                            BoundExpression {
+                                kind: BoundExpressionKind::Symbol {
+                                    symbol: *symbol,
+                                    receiver: None,
+                                },
+                                ty: kind.ty(),
+                                category: expression_category_for_symbol(&kind),
+                                semantic_use: SemanticUse::Value,
+                                conversion: None,
+                                span: expression.span.clone(),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         let candidates = match &expression.kind {
             BoundExpressionKind::Symbol { symbol, .. } => {
                 let symbol_info = self.binder.scopes.symbol(*symbol);
@@ -2276,38 +2597,12 @@ impl CompilationDriver {
                         callable_candidates(&lookup, &self.binder, owner)
                     })
             }
-            BoundExpressionKind::Member { base, symbol } => {
-                let symbol_info = self.binder.scopes.symbol(*symbol);
-                let Some(environment) = base
-                    .ty
-                    .and_then(|ty| self.binder.types.member_environment(ty))
-                else {
-                    return expression;
-                };
-                self.binder
-                    .scopes
-                    .lookup_symbol(environment, symbol_info.name, LookupRequest::ORDINARY)
-                    .map_or_else(Vec::new, |lookup| {
-                        lookup
-                            .primary
-                            .iter()
-                            .filter_map(|hit| {
-                                let SymbolKind::Routine(callable_type) =
-                                    self.binder.scopes.symbol(hit.symbol).kind
-                                else {
-                                    return None;
-                                };
-                                Some(ApplicationCandidate::Routine {
-                                    symbol: hit.symbol,
-                                    callable_type,
-                                    receiver: ApplicationReceiver::Explicit,
-                                })
-                            })
-                            .collect()
-                    })
+            BoundExpressionKind::Member { .. } | BoundExpressionKind::Inherited { .. } => {
+                self.application_candidates_from_callee(&expression)
             }
             _ => return expression,
         };
+        let has_forwarded_operands = !forwarded_operands.is_empty();
         let candidates = candidates
             .into_iter()
             .filter(|candidate| {
@@ -2316,18 +2611,19 @@ impl CompilationDriver {
                     .and_then(|ty| self.binder.types.callable(ty))
                     .is_some_and(|callable| {
                         (include_procedure || callable.signature.result.is_some())
-                            && callable
-                                .signature
-                                .parameters
-                                .iter()
-                                .all(|parameter| parameter.default.is_some())
+                            && (has_forwarded_operands
+                                || callable
+                                    .signature
+                                    .parameters
+                                    .iter()
+                                    .all(|parameter| parameter.default.is_some()))
                     })
             })
             .collect::<Vec<_>>();
         if candidates.is_empty() {
             return expression;
         }
-        let resolution = self.resolve_application(candidates, &[], modes);
+        let resolution = self.resolve_application(candidates, &forwarded_operands, modes);
         self.report_application_resolution(
             &resolution,
             expression.span.clone(),
@@ -2339,7 +2635,7 @@ impl CompilationDriver {
             kind: BoundExpressionKind::Application {
                 target: BoundApplicationTarget::Routine { resolution },
                 callee: Some(Box::new(expression)),
-                operands: Vec::new(),
+                operands: forwarded_operands,
                 modes,
             },
             ty,
@@ -2486,6 +2782,13 @@ impl CompilationDriver {
                             ApplicationReceiver::ImplicitSelf,
                             ApplicationReceiver::Lookup,
                         ),
+                        CallableFlavor::ClassMethod if explicit_receiver => {
+                            ApplicationReceiver::Explicit
+                        }
+                        CallableFlavor::ClassMethod => lookup_receiver.map_or(
+                            ApplicationReceiver::ImplicitSelf,
+                            ApplicationReceiver::Lookup,
+                        ),
                     };
                     symbols.push(*symbol);
                     candidates.push(ApplicationCandidate::Routine {
@@ -2574,14 +2877,7 @@ impl CompilationDriver {
                 self.bind_identifier(name, expression.span.clone(), owner, false)
             }
             ExprKind::Inherited(name) => {
-                let Some(name) = name else {
-                    self.diagnostics.push(Diagnostic::new(
-                        expression.span.clone(),
-                        "bare `inherited` requires the current method binding",
-                    ));
-                    return bound_error(expression.span.clone());
-                };
-                self.bind_identifier(name, expression.span.clone(), owner, false)
+                self.bind_inherited_expression(name.as_deref(), expression.span.clone())
             }
             ExprKind::Literal(literal) => BoundExpression {
                 ty: match literal {
@@ -2607,7 +2903,7 @@ impl CompilationDriver {
             },
             ExprKind::Application(application) => self.bind_application(application, owner),
             ExprKind::Member { base, member } => {
-                let base = self.bind_expression(base, owner);
+                let base = self.bind_member_base(base, owner);
                 let Some(base_type) = base.ty else {
                     return bound_error(expression.span.clone());
                 };
@@ -2775,6 +3071,145 @@ impl CompilationDriver {
         }
     }
 
+    fn bind_inherited_expression(&mut self, spelling: Option<&str>, span: Span) -> BoundExpression {
+        let Some(active_type) = self.active_routines.last().map(|active| active.ty) else {
+            self.diagnostics.push(Diagnostic::new(
+                span.clone(),
+                "`inherited` is only valid in a method body",
+            ));
+            return bound_error(span);
+        };
+        let Some(current) = self.binder.types.callable(active_type).cloned() else {
+            return bound_error(span);
+        };
+        let RoutineOwner::Type(owner_type) = current.owner else {
+            self.diagnostics.push(Diagnostic::new(
+                span.clone(),
+                "`inherited` is only valid in a method body",
+            ));
+            return bound_error(span);
+        };
+
+        let (symbols, forward_parameters) = if let Some(spelling) = spelling {
+            let Some(base_type) = self.binder.types.base_type(owner_type) else {
+                self.diagnostics.push(Diagnostic::new(
+                    span.clone(),
+                    "method owner has no inherited base type",
+                ));
+                return bound_error(span);
+            };
+            let Some(environment) = self.binder.types.member_environment(base_type) else {
+                return bound_error(span);
+            };
+            let name = self.binder.scopes.intern_name(spelling);
+            let Some(lookup) =
+                self.binder
+                    .scopes
+                    .lookup_symbol(environment, name, LookupRequest::ORDINARY)
+            else {
+                self.diagnostics.push(Diagnostic::new(
+                    span.clone(),
+                    format!("no inherited member named `{spelling}`"),
+                ));
+                return bound_error(span);
+            };
+            let include_shadowed = lookup.primary.iter().any(|hit| {
+                let SymbolKind::Routine(callable_type) = self.binder.scopes.symbol(hit.symbol).kind
+                else {
+                    return false;
+                };
+                self.binder
+                    .types
+                    .callable(callable_type)
+                    .is_some_and(|callable| callable.overload)
+            });
+            let mut symbols = lookup
+                .primary
+                .iter()
+                .filter_map(|hit| {
+                    matches!(
+                        self.binder.scopes.symbol(hit.symbol).kind,
+                        SymbolKind::Routine(_)
+                    )
+                    .then_some(hit.symbol)
+                })
+                .collect::<Vec<_>>();
+            if include_shadowed {
+                symbols.extend(lookup.shadowed.iter().flatten().filter_map(|hit| {
+                    matches!(
+                        self.binder.scopes.symbol(hit.symbol).kind,
+                        SymbolKind::Routine(_)
+                    )
+                    .then_some(hit.symbol)
+                }));
+            }
+            symbols.sort_unstable();
+            symbols.dedup();
+            (symbols, false)
+        } else {
+            let Some(ancestor) = current.method.and_then(MethodMetadata::ancestor) else {
+                self.diagnostics.push(Diagnostic::new(
+                    span.clone(),
+                    "current method has no exact inherited declaration",
+                ));
+                return bound_error(span);
+            };
+            (vec![ancestor], true)
+        };
+        let Some(callable_type) = symbols.iter().find_map(|symbol| {
+            let SymbolKind::Routine(callable_type) = self.binder.scopes.symbol(*symbol).kind else {
+                return None;
+            };
+            Some(callable_type)
+        }) else {
+            self.diagnostics.push(Diagnostic::new(
+                span.clone(),
+                "inherited member is not callable",
+            ));
+            return bound_error(span);
+        };
+        BoundExpression {
+            kind: BoundExpressionKind::Inherited {
+                symbols,
+                forward_parameters,
+            },
+            ty: Some(callable_type),
+            category: ExpressionCategory::Value,
+            semantic_use: SemanticUse::Value,
+            conversion: None,
+            span,
+        }
+    }
+
+    fn bind_member_base(&mut self, expression: &Expr, owner: Option<TypeRef>) -> BoundExpression {
+        if let ExprKind::Identifier(spelling) = &expression.kind {
+            let name = self.binder.scopes.intern_name(spelling);
+            if let Some(lookup) = self.binder.scopes.lookup_symbol(
+                self.binder.scopes.current_environment(),
+                name,
+                LookupRequest::ORDINARY,
+            ) {
+                let symbol = lookup.primary[0].symbol;
+                if let SymbolKind::Type(instance_type) = self.binder.scopes.symbol(symbol).kind
+                    && self.binder.types.is_class_type(instance_type)
+                {
+                    return BoundExpression {
+                        kind: BoundExpressionKind::TypeIdentifier {
+                            symbol,
+                            instance_type,
+                        },
+                        ty: Some(instance_type),
+                        category: ExpressionCategory::Value,
+                        semantic_use: SemanticUse::Value,
+                        conversion: None,
+                        span: expression.span.clone(),
+                    };
+                }
+            }
+        }
+        self.bind_expression(expression, owner)
+    }
+
     fn bind_identifier(
         &mut self,
         spelling: &str,
@@ -2904,8 +3339,8 @@ impl CompilationDriver {
                 }
                 let mut callee = self.bind_expression_raw(callee, owner);
                 callee = self.bind_property_use(callee, SemanticUse::Value, application.modes);
-                let candidate = self.application_candidate_from_callee(&callee);
-                let Some(candidate) = candidate else {
+                let candidates = self.application_candidates_from_callee(&callee);
+                if candidates.is_empty() {
                     self.diagnostics.push(Diagnostic::new(
                         application.span.clone(),
                         "application operand is not callable",
@@ -2924,20 +3359,17 @@ impl CompilationDriver {
                         span: application.span.clone(),
                     };
                 };
-                let target_kind = match candidate {
-                    ApplicationCandidate::Routine { .. } => 0,
-                    ApplicationCandidate::CallableValue { .. } => 1,
-                    ApplicationCandidate::Conversion { .. } => unreachable!(),
-                };
-                let resolution =
-                    self.resolve_application(vec![candidate], &operands, application.modes);
+                let routine_target = candidates
+                    .iter()
+                    .all(|candidate| matches!(candidate, ApplicationCandidate::Routine { .. }));
+                let resolution = self.resolve_application(candidates, &operands, application.modes);
                 self.report_application_resolution(
                     &resolution,
                     application.span.clone(),
                     "callable expression",
                 );
                 let result = resolution.result_type();
-                let target = if target_kind == 0 {
+                let target = if routine_target {
                     BoundApplicationTarget::Routine { resolution }
                 } else {
                     BoundApplicationTarget::CallableValue { resolution }
@@ -3359,42 +3791,127 @@ impl CompilationDriver {
         }
     }
 
-    fn application_candidate_from_callee(
+    fn application_candidates_from_callee(
         &self,
         callee: &BoundExpression,
-    ) -> Option<ApplicationCandidate> {
-        let (symbol, lookup_receiver, explicit_receiver) = match &callee.kind {
-            BoundExpressionKind::Symbol { symbol, receiver } => (Some(*symbol), *receiver, false),
-            BoundExpressionKind::Member { symbol, .. } => (Some(*symbol), None, true),
-            BoundExpressionKind::RoutineDesignator { routine, .. } => {
-                return self.application_candidate_from_callee(routine);
+    ) -> Vec<ApplicationCandidate> {
+        match &callee.kind {
+            BoundExpressionKind::Member { base, symbol } => {
+                let Some(base_type) = base.ty else {
+                    return Vec::new();
+                };
+                let Some(environment) = self.binder.types.member_environment(base_type) else {
+                    return Vec::new();
+                };
+                let name = self.binder.scopes.symbol(*symbol).name;
+                let Some(lookup) =
+                    self.binder
+                        .scopes
+                        .lookup_symbol(environment, name, LookupRequest::ORDINARY)
+                else {
+                    return Vec::new();
+                };
+                let include_inherited = lookup.primary.iter().any(|hit| {
+                    let SymbolKind::Routine(callable_type) =
+                        self.binder.scopes.symbol(hit.symbol).kind
+                    else {
+                        return false;
+                    };
+                    self.binder
+                        .types
+                        .callable(callable_type)
+                        .is_some_and(|callable| callable.overload)
+                });
+                let class_identifier =
+                    matches!(&base.kind, BoundExpressionKind::TypeIdentifier { .. });
+                let instance_type = match &base.kind {
+                    BoundExpressionKind::TypeIdentifier { instance_type, .. } => {
+                        Some(*instance_type)
+                    }
+                    _ => None,
+                };
+                let mut seen = BTreeSet::new();
+                return lookup
+                    .primary
+                    .iter()
+                    .chain(
+                        include_inherited
+                            .then_some(lookup.shadowed.iter().flatten())
+                            .into_iter()
+                            .flatten(),
+                    )
+                    .filter_map(|hit| {
+                        if !seen.insert(hit.symbol) {
+                            return None;
+                        }
+                        let SymbolKind::Routine(callable_type) =
+                            self.binder.scopes.symbol(hit.symbol).kind
+                        else {
+                            return None;
+                        };
+                        self.binder.types.callable(callable_type)?;
+                        let receiver = if class_identifier {
+                            ApplicationReceiver::ClassIdentifier(instance_type.unwrap())
+                        } else {
+                            ApplicationReceiver::Explicit
+                        };
+                        Some(ApplicationCandidate::Routine {
+                            symbol: hit.symbol,
+                            callable_type,
+                            receiver,
+                        })
+                    })
+                    .collect();
             }
-            _ => (None, None, false),
+            BoundExpressionKind::Inherited { symbols, .. } => {
+                return symbols
+                    .iter()
+                    .filter_map(|symbol| {
+                        let SymbolKind::Routine(callable_type) =
+                            self.binder.scopes.symbol(*symbol).kind
+                        else {
+                            return None;
+                        };
+                        Some(ApplicationCandidate::Routine {
+                            symbol: *symbol,
+                            callable_type,
+                            receiver: ApplicationReceiver::Inherited,
+                        })
+                    })
+                    .collect();
+            }
+            BoundExpressionKind::RoutineDesignator { routine, .. } => {
+                return self.application_candidates_from_callee(routine);
+            }
+            _ => {}
+        }
+        let (symbol, lookup_receiver) = match &callee.kind {
+            BoundExpressionKind::Symbol { symbol, receiver } => (Some(*symbol), *receiver),
+            _ => (None, None),
         };
-        let callable_type = callee.ty?;
-        let callable = self.binder.types.callable(callable_type)?;
+        let Some(callable_type) = callee.ty else {
+            return Vec::new();
+        };
+        let Some(callable) = self.binder.types.callable(callable_type) else {
+            return Vec::new();
+        };
         if let Some(symbol) = symbol
             && matches!(
                 self.binder.scopes.symbol(symbol).kind,
                 SymbolKind::Routine(_)
             )
         {
-            let receiver = if explicit_receiver {
-                ApplicationReceiver::Explicit
-            } else {
-                declared_receiver(callable.flavor, lookup_receiver, false)
-            };
-            return Some(ApplicationCandidate::Routine {
+            return vec![ApplicationCandidate::Routine {
                 symbol,
                 callable_type,
-                receiver,
-            });
+                receiver: declared_receiver(callable.flavor, lookup_receiver, false),
+            }];
         }
-        Some(ApplicationCandidate::CallableValue {
+        vec![ApplicationCandidate::CallableValue {
             symbol,
             callable_type,
             receiver: ApplicationReceiver::CallableValue { lookup_receiver },
-        })
+        }]
     }
 
     fn resolve_application(
@@ -3617,6 +4134,8 @@ impl CompilationDriver {
                     captures: Vec::new(),
                     environment: EnvironmentRequirement::None,
                     has_body: false,
+                    method: None,
+                    overload: false,
                 }))
             }
             TypeSyntaxKind::Set { element } => {
@@ -3769,8 +4288,12 @@ fn declared_receiver(
     match (flavor, lookup_receiver) {
         (_, Some(receiver)) => ApplicationReceiver::Lookup(receiver),
         (CallableFlavor::Nested, None) => ApplicationReceiver::StaticLink,
-        (CallableFlavor::Method, None) if implicit_self => ApplicationReceiver::ImplicitSelf,
-        (CallableFlavor::Routine | CallableFlavor::Method, None) => ApplicationReceiver::None,
+        (CallableFlavor::Method | CallableFlavor::ClassMethod, None) if implicit_self => {
+            ApplicationReceiver::ImplicitSelf
+        }
+        (CallableFlavor::Routine | CallableFlavor::Method | CallableFlavor::ClassMethod, None) => {
+            ApplicationReceiver::None
+        }
     }
 }
 
@@ -3912,6 +4435,8 @@ fn install_system_callables(binder: &mut SemanticBinder, builtins: BuiltinTypes)
                 captures: Vec::new(),
                 environment: EnvironmentRequirement::None,
                 has_body: false,
+                method: None,
+                overload: true,
             },
         );
         let symbol = binder

@@ -4,9 +4,9 @@ use super::{
     AggregateShape, CallableFlavor, CallableType, ConstantRegistry, DeclId, DeclarationMode,
     DeclarationState, DeclareError, EnvironmentCheckpoint, EnvironmentId, EnvironmentRequirement,
     Field, FieldLayout, FrameKind, IncompleteReason, InterfaceType, LookupEdge, LookupRequest,
-    NameId, ObjectType, PackedRecordType, PascalType, PointerType, RegionOwner, RegularRecordType,
-    RoutineOwner, RoutineSignature, ScopeGraph, StorageLayout, SymbolId, SymbolKind, TypeOwner,
-    TypeRef, TypeRegistry, TypeRegistryError, TypeSectionId, VariantPart,
+    MethodMetadata, NameId, ObjectType, PackedRecordType, PascalType, PointerType, RegionOwner,
+    RegularRecordType, RoutineOwner, RoutineSignature, ScopeGraph, StorageLayout, SymbolId,
+    SymbolKind, TypeOwner, TypeRef, TypeRegistry, TypeRegistryError, TypeSectionId, VariantPart,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +55,7 @@ pub struct AggregateDefinition {
     pub fields: Vec<Field>,
     pub methods: Vec<TypeRef>,
     pub default_property: Option<SymbolId>,
+    pub next_virtual_slot: u32,
     member_region: super::RegionId,
     inherited_environment: Option<EnvironmentId>,
     selected_environment: EnvironmentCheckpoint,
@@ -296,6 +297,8 @@ impl SemanticBinder {
                 captures: Vec::new(),
                 environment,
                 has_body: false,
+                method: None,
+                overload: mode == DeclarationMode::Overload,
             },
         );
         let symbol = match self.scopes.declare(
@@ -350,6 +353,11 @@ impl SemanticBinder {
             .scopes
             .create_detached_region(RegionOwner::Type(declared.ty), fallbacks);
         let selected_environment = self.scopes.select_environment(member_environment);
+        let next_virtual_slot = match kind {
+            AggregateKind::Object { base: Some(base) }
+            | AggregateKind::Class { base: Some(base) } => self.types.virtual_slot_count(base),
+            _ => 0,
+        };
         Ok(AggregateDefinition {
             declared,
             kind,
@@ -357,6 +365,7 @@ impl SemanticBinder {
             fields: Vec::new(),
             methods: Vec::new(),
             default_property: None,
+            next_virtual_slot,
             member_region,
             inherited_environment,
             selected_environment,
@@ -386,6 +395,8 @@ impl SemanticBinder {
         name: NameId,
         signature: RoutineSignature,
         mode: DeclarationMode,
+        flavor: CallableFlavor,
+        metadata: MethodMetadata,
     ) -> Result<DeclaredRoutine, BindError> {
         let method = self.declare_routine(
             name,
@@ -393,8 +404,14 @@ impl SemanticBinder {
             RoutineOwner::Type(aggregate.declared.ty),
             mode,
         )?;
+        self.types
+            .set_callable_method(method.ty, flavor, metadata)?;
         aggregate.methods.push(method.ty);
         Ok(method)
+    }
+
+    pub const fn inherited_environment(aggregate: &AggregateDefinition) -> Option<EnvironmentId> {
+        aggregate.inherited_environment
     }
 
     pub fn end_aggregate(

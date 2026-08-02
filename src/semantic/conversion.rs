@@ -292,7 +292,10 @@ impl<'a> ConversionResolver<'a> {
                 preference: None,
             };
         };
-        if callable.flavor == CallableFlavor::Method {
+        if matches!(
+            callable.flavor,
+            CallableFlavor::Method | CallableFlavor::ClassMethod
+        ) {
             return ConversionAttempt {
                 candidate,
                 result: None,

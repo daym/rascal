@@ -16,23 +16,25 @@ use crate::{
 };
 
 use super::{
-    ActualArgument, AggregateDefinition, AggregateKind, AliasType, ApplicationCandidate,
-    ApplicationReceiver, ApplicationResolution, ApplicationResolver, ApplicationSelection,
-    ArrayType, BindError, BoundApplicationTarget, BoundAssignment, BoundBody, BoundCaseArm,
-    BoundCaseLabel, BoundExceptionHandler, BoundExpression, BoundExpressionKind,
+    ActualArgument, ActualArgumentForm, AggregateDefinition, AggregateKind, AliasType,
+    ApplicationCandidate, ApplicationReceiver, ApplicationResolution, ApplicationResolver,
+    ApplicationSelection, ArrayType, BindError, BoundApplicationTarget, BoundAssignment, BoundBody,
+    BoundCaseArm, BoundCaseLabel, BoundExceptionHandler, BoundExpression, BoundExpressionKind,
     BoundPropertyBinding, BoundSetElement, BoundStatement, BoundStatementKind,
-    BoundTryContinuation, CallableFlavor, CallableType, CallingConvention, Capture, ConstantEntry,
-    ConstantEvaluator, ConstantValue, ConversionResolution, ConversionResolver,
+    BoundTryContinuation, BuiltinActual, BuiltinContract, BuiltinFamilyDecl, BuiltinOperandForm,
+    BuiltinRegistry, BuiltinTypeContext, CallableFlavor, CallableType, CallingConvention, Capture,
+    ConstantEntry, ConstantEvaluator, ConstantValue, ConversionResolution, ConversionResolver,
     ConversionSelection, DeclarationMode, DeclarationState, DeclaredRoutine, EnumMember, EnumType,
     EnvironmentId, EnvironmentRequirement, ExpressionCategory, FieldLayout, FormalParameter,
     FrameKind, IncompleteReason, LookupBarrier, LookupEdge, LookupRequest, LookupResult,
-    MethodDispatch, MethodMetadata, ModuleGraphError, ModuleId, ModulePhase, ModuleRegistry,
-    NameId, NilType, NodeId, OpaqueType, OrdinalDomain, ParameterMode, PointerType, PrimitiveKind,
-    PrimitiveType, PropertyAccessKind, PropertyAccessor, PropertySymbol, RawMethodType, ReceiverId,
-    RegionOwner, RoutineOwner, RoutineSignature, SemanticBinder, SemanticUse, SetType,
-    StorageLayout, StringKind, StringLiteralType, StringType, SubrangeType, SymbolCategory,
-    SymbolFilter, SymbolId, SymbolKind, TypeOwner, TypeRef, UnitType, UntypedPointerType,
-    VariantAlternative, VariantPart,
+    MetadataQuery, MethodDispatch, MethodMetadata, ModuleGraphError, ModuleId, ModulePhase,
+    ModuleRegistry, NameId, NilType, NodeId, NumericOperation, OpaqueType, OrdinalDomain,
+    OrdinalOperation, ParameterMode, PointerType, PrimitiveKind, PrimitiveType, PropertyAccessKind,
+    PropertyAccessor, PropertySymbol, RawMethodType, ReceiverId, RegionOwner, RoutineOwner,
+    RoutineSignature, SemanticBinder, SemanticUse, SetType, StepOperation, StorageLayout,
+    StringKind, StringLiteralType, StringType, SubrangeType, SymbolCategory, SymbolFilter,
+    SymbolId, SymbolKind, TypeOwner, TypeRef, UnitType, UntypedPointerType, VariantAlternative,
+    VariantPart,
 };
 
 #[derive(Clone, Debug)]
@@ -49,6 +51,7 @@ pub struct BoundFile {
 #[derive(Debug)]
 pub struct SemanticCompilation {
     pub binder: SemanticBinder,
+    pub builtin_families: BuiltinRegistry,
     pub modules: ModuleRegistry,
     pub files: Vec<BoundFile>,
     pub bodies: Vec<BoundBody>,
@@ -58,9 +61,13 @@ pub struct SemanticCompilation {
 #[derive(Clone, Copy, Debug)]
 struct BuiltinTypes {
     integer: TypeRef,
+    long_integer: TypeRef,
     real: TypeRef,
     boolean: TypeRef,
     character: TypeRef,
+    byte: TypeRef,
+    word: TypeRef,
+    size_unsigned: TypeRef,
     nil: TypeRef,
     untyped_parameter: TypeRef,
 }
@@ -88,6 +95,7 @@ struct ActiveRoutine {
 
 struct CompilationDriver {
     binder: SemanticBinder,
+    builtin_families: BuiltinRegistry,
     modules: ModuleRegistry,
     module_names: BTreeMap<String, ModuleId>,
     diagnostics: Vec<Diagnostic>,
@@ -107,7 +115,8 @@ impl CompilationDriver {
     fn new() -> Self {
         let mut binder = SemanticBinder::new();
         let builtins = install_builtins(&mut binder);
-        install_system_callables(&mut binder, builtins);
+        let mut builtin_families = BuiltinRegistry::default();
+        install_system_builtins(&mut binder, &mut builtin_families);
         let root_region = binder
             .scopes
             .environment_region(binder.scopes.current_environment());
@@ -119,6 +128,7 @@ impl CompilationDriver {
         module_names.insert("system".to_owned(), system_module);
         Self {
             binder,
+            builtin_families,
             modules,
             module_names,
             diagnostics: Vec::new(),
@@ -2597,7 +2607,7 @@ impl CompilationDriver {
                         LookupRequest::ORDINARY,
                     )
                     .map_or_else(Vec::new, |lookup| {
-                        callable_candidates(&lookup, &self.binder, owner)
+                        self.callable_candidates(&lookup, &forwarded_operands, modes, owner)
                     })
             }
             BoundExpressionKind::Member { .. } | BoundExpressionKind::Inherited { .. } => {
@@ -3312,6 +3322,17 @@ impl CompilationDriver {
         application: &Application,
         owner: Option<TypeRef>,
     ) -> BoundExpression {
+        if let Callee::Expression(callee) = &application.callee
+            && let ExprKind::Identifier(name) = &callee.kind
+        {
+            return self.bind_named_application(
+                name,
+                application.span.clone(),
+                &application.operands,
+                owner,
+                application.modes,
+            );
+        }
         let address_operator = matches!(
             application.callee,
             Callee::Operator(Operator::Address | Operator::ProcedureSlotAddress)
@@ -3331,15 +3352,6 @@ impl CompilationDriver {
             .collect::<Vec<_>>();
         match &application.callee {
             Callee::Expression(callee) => {
-                if let ExprKind::Identifier(name) = &callee.kind {
-                    return self.bind_named_application(
-                        name,
-                        application.span.clone(),
-                        operands,
-                        owner,
-                        application.modes,
-                    );
-                }
                 let mut callee = self.bind_expression_raw(callee, owner);
                 callee = self.bind_property_use(callee, SemanticUse::Value, application.modes);
                 let candidates = self.application_candidates_from_callee(&callee);
@@ -3404,7 +3416,7 @@ impl CompilationDriver {
         &mut self,
         spelling: &str,
         span: Span,
-        operands: Vec<BoundExpression>,
+        operand_syntax: &[Expr],
         owner: Option<TypeRef>,
         modes: crate::ModeSnapshot,
     ) -> BoundExpression {
@@ -3418,11 +3430,69 @@ impl CompilationDriver {
                 span.clone(),
                 format!("unknown application name `{spelling}`"),
             ));
+            let operands = operand_syntax
+                .iter()
+                .map(|operand| self.bind_expression_for(operand, owner, SemanticUse::Value))
+                .collect();
             return bound_application_error(span, operands, modes);
         };
+        let type_operand_permissions = (0..operand_syntax.len())
+            .map(|index| {
+                result
+                    .primary
+                    .iter()
+                    .chain(result.shadowed.iter().flatten())
+                    .any(|hit| {
+                        let SymbolKind::Builtin(family) =
+                            self.binder.scopes.symbol(hit.symbol).kind
+                        else {
+                            return false;
+                        };
+                        self.builtin_families
+                            .get(family)
+                            .contract
+                            .permits_type_operand(index)
+                    })
+            })
+            .collect::<Vec<_>>();
+        let operands = operand_syntax
+            .iter()
+            .enumerate()
+            .map(|(index, operand)| {
+                if type_operand_permissions[index]
+                    && let ExprKind::Identifier(type_name) = &operand.kind
+                {
+                    let name = self.binder.scopes.intern_name(type_name);
+                    if let Some(type_lookup) = self.binder.scopes.lookup_symbol(
+                        self.binder.scopes.current_environment(),
+                        name,
+                        LookupRequest::ORDINARY,
+                    ) {
+                        let symbol = type_lookup.primary[0].symbol;
+                        if let SymbolKind::Type(represented_type) =
+                            self.binder.scopes.symbol(symbol).kind
+                        {
+                            return BoundExpression {
+                                kind: BoundExpressionKind::TypeOperand {
+                                    symbol,
+                                    represented_type,
+                                },
+                                ty: Some(represented_type),
+                                category: ExpressionCategory::Value,
+                                semantic_use: SemanticUse::Value,
+                                conversion: None,
+                                span: operand.span.clone(),
+                            };
+                        }
+                    }
+                }
+                self.bind_expression_for(operand, owner, SemanticUse::Value)
+            })
+            .collect::<Vec<_>>();
         let primary = result.primary[0].symbol;
         let primary_receiver = result.primary[0].receiver;
         let primary_kind = self.binder.scopes.symbol(primary).kind.clone();
+        let builtin_target = matches!(primary_kind, SymbolKind::Builtin(_));
         match primary_kind {
             SymbolKind::Type(destination) => {
                 let resolution = self.resolve_application(
@@ -3453,8 +3523,8 @@ impl CompilationDriver {
                     span,
                 }
             }
-            SymbolKind::Routine(_) => {
-                let candidates = callable_candidates(&result, &self.binder, owner);
+            SymbolKind::Routine(_) | SymbolKind::Builtin(_) => {
+                let candidates = self.callable_candidates(&result, &operands, modes, owner);
                 let resolution = self.resolve_application(candidates, &operands, modes);
                 self.report_application_resolution(
                     &resolution,
@@ -3464,7 +3534,11 @@ impl CompilationDriver {
                 let result_type = resolution.result_type();
                 BoundExpression {
                     kind: BoundExpressionKind::Application {
-                        target: BoundApplicationTarget::Routine { resolution },
+                        target: if builtin_target {
+                            BoundApplicationTarget::Builtin { resolution }
+                        } else {
+                            BoundApplicationTarget::Routine { resolution }
+                        },
                         callee: None,
                         operands,
                         modes,
@@ -3658,7 +3732,7 @@ impl CompilationDriver {
                 LookupRequest::ORDINARY,
             )
             .map_or_else(Vec::new, |result| {
-                callable_candidates(&result, &self.binder, None)
+                self.callable_candidates(&result, &operands, modes, None)
             });
         let resolution = self.resolve_application(candidates, &operands, modes);
         self.report_application_resolution(
@@ -3917,6 +3991,75 @@ impl CompilationDriver {
         }]
     }
 
+    fn callable_candidates(
+        &self,
+        result: &LookupResult,
+        operands: &[BoundExpression],
+        modes: crate::ModeSnapshot,
+        current_callable: Option<TypeRef>,
+    ) -> Vec<ApplicationCandidate> {
+        let actuals = operands
+            .iter()
+            .map(|operand| BuiltinActual {
+                form: if matches!(operand.kind, BoundExpressionKind::TypeOperand { .. }) {
+                    BuiltinOperandForm::Type
+                } else {
+                    BuiltinOperandForm::Value
+                },
+                ty: operand.ty,
+                addressable: operand.category.is_addressable(),
+            })
+            .collect::<Vec<_>>();
+        let builtin_types = BuiltinTypeContext {
+            integer: self.builtins.integer,
+            long_integer: self.builtins.long_integer,
+            real: self.builtins.real,
+            boolean: self.builtins.boolean,
+            character: self.builtins.character,
+            byte: self.builtins.byte,
+            word: self.builtins.word,
+            size_unsigned: self.builtins.size_unsigned,
+        };
+        let mut seen = BTreeSet::new();
+        result
+            .primary
+            .iter()
+            .chain(result.shadowed.iter().flatten())
+            .filter_map(|hit| {
+                if !seen.insert(hit.symbol) {
+                    return None;
+                }
+                match self.binder.scopes.symbol(hit.symbol).kind {
+                    SymbolKind::Routine(callable_type) => {
+                        let flavor = self.binder.types.callable(callable_type)?.flavor;
+                        let implicit_self = current_callable
+                            .and_then(|current| self.binder.types.callable(current))
+                            .is_some_and(|current| matches!(current.owner, RoutineOwner::Type(_)));
+                        Some(ApplicationCandidate::Routine {
+                            symbol: hit.symbol,
+                            callable_type,
+                            receiver: declared_receiver(flavor, hit.receiver, implicit_self),
+                        })
+                    }
+                    SymbolKind::Builtin(family) => {
+                        let instantiation = self.builtin_families.get(family).instantiate(
+                            &actuals,
+                            &self.binder.types,
+                            builtin_types,
+                            modes,
+                        );
+                        Some(ApplicationCandidate::Builtin {
+                            symbol: hit.symbol,
+                            family,
+                            instantiation,
+                        })
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
     fn resolve_application(
         &self,
         candidates: Vec<ApplicationCandidate>,
@@ -3926,6 +4069,11 @@ impl CompilationDriver {
         let actuals = operands
             .iter()
             .map(|operand| ActualArgument {
+                form: if matches!(operand.kind, BoundExpressionKind::TypeOperand { .. }) {
+                    ActualArgumentForm::Type
+                } else {
+                    ActualArgumentForm::Value
+                },
                 ty: operand.ty,
                 addressable: operand.category.is_addressable(),
             })
@@ -4253,36 +4401,6 @@ impl CompilationDriver {
     }
 }
 
-fn callable_candidates(
-    result: &LookupResult,
-    binder: &SemanticBinder,
-    current_callable: Option<TypeRef>,
-) -> Vec<ApplicationCandidate> {
-    let mut seen = BTreeSet::new();
-    result
-        .primary
-        .iter()
-        .chain(result.shadowed.iter().flatten())
-        .filter_map(|hit| {
-            if !seen.insert(hit.symbol) {
-                return None;
-            }
-            let SymbolKind::Routine(callable_type) = binder.scopes.symbol(hit.symbol).kind else {
-                return None;
-            };
-            let flavor = binder.types.callable(callable_type)?.flavor;
-            let implicit_self = current_callable
-                .and_then(|current| binder.types.callable(current))
-                .is_some_and(|current| matches!(current.owner, RoutineOwner::Type(_)));
-            Some(ApplicationCandidate::Routine {
-                symbol: hit.symbol,
-                callable_type,
-                receiver: declared_receiver(flavor, hit.receiver, implicit_self),
-            })
-        })
-        .collect()
-}
-
 fn declared_receiver(
     flavor: CallableFlavor,
     lookup_receiver: Option<ReceiverId>,
@@ -4334,6 +4452,7 @@ fn expression_category_for_symbol(kind: &SymbolKind) -> ExpressionCategory {
         },
         SymbolKind::Type(_)
         | SymbolKind::Routine(_)
+        | SymbolKind::Builtin(_)
         | SymbolKind::Constant(_)
         | SymbolKind::Label => ExpressionCategory::Value,
     }
@@ -4406,163 +4525,141 @@ fn opaque_type() -> OpaqueType {
     }
 }
 
-fn install_system_callables(binder: &mut SemanticBinder, builtins: BuiltinTypes) {
-    fn callable(
+fn install_system_builtins(binder: &mut SemanticBinder, registry: &mut BuiltinRegistry) {
+    fn family(
         binder: &mut SemanticBinder,
-        name: NameId,
-        parameters: &[TypeRef],
-        result: Option<TypeRef>,
+        registry: &mut BuiltinRegistry,
+        spelling: &str,
+        contract: BuiltinContract,
     ) {
-        let ty = binder.types.allocate_complete(
-            TypeOwner::Builtin,
-            Some(name),
-            binder.scopes.current_environment(),
-            CallableType {
-                owner: RoutineOwner::Module,
-                flavor: CallableFlavor::Routine,
-                signature: RoutineSignature {
-                    parameters: parameters
-                        .iter()
-                        .map(|ty| FormalParameter {
-                            mode: ParameterMode::Value,
-                            ty: *ty,
-                            default: None,
-                        })
-                        .collect(),
-                    result,
-                    calling_convention: CallingConvention::Pascal,
-                },
-                declaration_region: None,
-                nested_routines: Vec::new(),
-                local_types: Vec::new(),
-                captures: Vec::new(),
-                environment: EnvironmentRequirement::None,
-                has_body: false,
-                method: None,
-                overload: true,
-            },
-        );
-        let symbol = binder
+        let name = binder.scopes.intern_name(spelling);
+        let declaration = registry.register(BuiltinFamilyDecl { contract });
+        binder
             .scopes
             .declare(
                 name,
-                SymbolKind::Routine(ty),
+                SymbolKind::Builtin(declaration),
                 DeclarationState::Complete,
                 DeclarationMode::Overload,
             )
-            .expect("System callable declarations are overload-compatible");
-        binder
-            .types
-            .set_declared_in(ty, binder.scopes.symbol(symbol).declared_in);
+            .expect("System builtin declarations are overload-compatible");
     }
 
-    fn operator_callable(
+    fn operator_family(
         binder: &mut SemanticBinder,
-        invocation: OperatorInvocation,
-        spelling: &str,
+        registry: &mut BuiltinRegistry,
+        operator: Operator,
         checks_enabled: bool,
         logical_operands: bool,
-        parameters: &[TypeRef],
-        result: Option<TypeRef>,
     ) {
+        let unary = matches!(
+            operator,
+            Operator::Positive | Operator::Negative | Operator::Not
+        );
+        let invocation = if unary {
+            OperatorInvocation::UnaryToken
+        } else {
+            OperatorInvocation::BinaryToken
+        };
+        let arity = if unary { 1 } else { 2 };
         let identifier = operator_invocation_identifier(
             invocation,
-            spelling,
-            parameters.len(),
+            operator.spelling(),
+            arity,
             checks_enabled,
             logical_operands,
         )
         .expect("System operator has a catalog identity");
-        let name = binder.scopes.intern_name(identifier);
-        callable(binder, name, parameters, result);
+        family(
+            binder,
+            registry,
+            identifier,
+            BuiltinContract::Operator(operator),
+        );
     }
 
-    for spelling in ["+", "-", "*", "div"] {
+    for operator in [
+        Operator::Add,
+        Operator::Subtract,
+        Operator::Multiply,
+        Operator::IntegerDivide,
+    ] {
         for checks_enabled in [false, true] {
-            operator_callable(
-                binder,
-                OperatorInvocation::BinaryToken,
-                spelling,
-                checks_enabled,
-                false,
-                &[builtins.integer, builtins.integer],
-                Some(builtins.integer),
-            );
+            operator_family(binder, registry, operator, checks_enabled, false);
         }
     }
-    for spelling in ["/", "mod", "shl", "shr"] {
-        operator_callable(
-            binder,
-            OperatorInvocation::BinaryToken,
-            spelling,
-            false,
-            false,
-            &[builtins.integer, builtins.integer],
-            Some(builtins.integer),
-        );
+    for operator in [
+        Operator::RealDivide,
+        Operator::Modulo,
+        Operator::ShiftLeft,
+        Operator::ShiftRight,
+    ] {
+        operator_family(binder, registry, operator, false, false);
     }
     for checks_enabled in [false, true] {
-        operator_callable(
+        operator_family(binder, registry, Operator::Negative, checks_enabled, false);
+    }
+    operator_family(binder, registry, Operator::Positive, false, false);
+    for operator in [
+        Operator::Equal,
+        Operator::NotEqual,
+        Operator::Less,
+        Operator::Greater,
+        Operator::LessEqual,
+        Operator::GreaterEqual,
+    ] {
+        operator_family(binder, registry, operator, false, false);
+    }
+    for operator in [Operator::And, Operator::Or, Operator::Xor] {
+        operator_family(binder, registry, operator, false, false);
+        operator_family(binder, registry, operator, false, true);
+    }
+    operator_family(binder, registry, Operator::Not, false, true);
+
+    for (spelling, query) in [
+        ("low", MetadataQuery::Low),
+        ("high", MetadataQuery::High),
+        ("sizeof", MetadataQuery::SizeOf),
+        ("length", MetadataQuery::Length),
+    ] {
+        family(binder, registry, spelling, BuiltinContract::Metadata(query));
+    }
+    for (spelling, operation) in [
+        ("odd", OrdinalOperation::Odd),
+        ("ord", OrdinalOperation::Ord),
+        ("chr", OrdinalOperation::Chr),
+        ("pred", OrdinalOperation::Pred),
+        ("succ", OrdinalOperation::Succ),
+    ] {
+        family(
             binder,
-            OperatorInvocation::UnaryToken,
-            "-",
-            checks_enabled,
-            false,
-            &[builtins.integer],
-            Some(builtins.integer),
+            registry,
+            spelling,
+            BuiltinContract::Ordinal(operation),
         );
     }
-    operator_callable(
-        binder,
-        OperatorInvocation::UnaryToken,
-        "+",
-        false,
-        false,
-        &[builtins.integer],
-        Some(builtins.integer),
-    );
-    for spelling in ["=", "<>", "<", ">", "<=", ">="] {
-        operator_callable(
+    for (spelling, operation) in [
+        ("abs", NumericOperation::Abs),
+        ("sqr", NumericOperation::Sqr),
+    ] {
+        family(
             binder,
-            OperatorInvocation::BinaryToken,
+            registry,
             spelling,
-            false,
-            false,
-            &[builtins.integer, builtins.integer],
-            Some(builtins.boolean),
+            BuiltinContract::Numeric(operation),
         );
     }
-    for spelling in ["and", "or", "xor"] {
-        operator_callable(
+    for (spelling, operation) in [
+        ("inc", StepOperation::Increment),
+        ("dec", StepOperation::Decrement),
+    ] {
+        family(
             binder,
-            OperatorInvocation::BinaryToken,
+            registry,
             spelling,
-            false,
-            false,
-            &[builtins.integer, builtins.integer],
-            Some(builtins.integer),
-        );
-        operator_callable(
-            binder,
-            OperatorInvocation::BinaryToken,
-            spelling,
-            false,
-            true,
-            &[builtins.boolean, builtins.boolean],
-            Some(builtins.boolean),
+            BuiltinContract::StepMutation(operation),
         );
     }
-    operator_callable(
-        binder,
-        OperatorInvocation::UnaryToken,
-        "not",
-        false,
-        true,
-        &[builtins.boolean],
-        Some(builtins.boolean),
-    );
-    let high = binder.scopes.intern_name("high");
-    callable(binder, high, &[builtins.integer], Some(builtins.integer));
 }
 
 fn install_builtins(binder: &mut SemanticBinder) -> BuiltinTypes {
@@ -4594,6 +4691,20 @@ fn install_builtins(binder: &mut SemanticBinder) -> BuiltinTypes {
         ty
     }
 
+    fn alias(binder: &mut SemanticBinder, name: &str, target: TypeRef) -> TypeRef {
+        let name = binder.scopes.intern_name(name);
+        binder
+            .define_type(
+                name,
+                AliasType {
+                    target,
+                    nominal: false,
+                },
+            )
+            .expect("builtin names are unique")
+            .ty
+    }
+
     let integer_layout = StorageLayout {
         size: 4,
         alignment: 4,
@@ -4607,17 +4718,28 @@ fn install_builtins(binder: &mut SemanticBinder) -> BuiltinTypes {
         },
         integer_layout,
     );
-    for name in ["longint", "cardinal"] {
-        let _ = primitive(
-            binder,
-            name,
-            PrimitiveKind::Integer {
-                bits: 32,
-                signed: name == "longint",
-            },
-            integer_layout,
-        );
-    }
+    let long_integer = primitive(
+        binder,
+        "longint",
+        PrimitiveKind::Integer {
+            bits: 32,
+            signed: true,
+        },
+        integer_layout,
+    );
+    let cardinal = primitive(
+        binder,
+        "cardinal",
+        PrimitiveKind::Integer {
+            bits: 32,
+            signed: false,
+        },
+        integer_layout,
+    );
+    let mut byte = None;
+    let mut word = None;
+    let mut int64 = None;
+    let mut qword = None;
     for (name, bits, signed) in [
         ("byte", 8, false),
         ("shortint", 8, true),
@@ -4627,7 +4749,7 @@ fn install_builtins(binder: &mut SemanticBinder) -> BuiltinTypes {
         ("qword", 64, false),
     ] {
         let bytes = u64::from(bits / 8);
-        let _ = primitive(
+        let ty = primitive(
             binder,
             name,
             PrimitiveKind::Integer { bits, signed },
@@ -4636,7 +4758,24 @@ fn install_builtins(binder: &mut SemanticBinder) -> BuiltinTypes {
                 alignment: u32::from(bits / 8),
             },
         );
+        match name {
+            "byte" => byte = Some(ty),
+            "word" => word = Some(ty),
+            "int64" => int64 = Some(ty),
+            "qword" => qword = Some(ty),
+            _ => {}
+        }
     }
+    let byte = byte.unwrap();
+    let word = word.unwrap();
+    let int64 = int64.unwrap();
+    let qword = qword.unwrap();
+    let _ = alias(binder, "longword", cardinal);
+    let _ = alias(binder, "dword", cardinal);
+    let _ = alias(binder, "sizeint", int64);
+    let size_unsigned = alias(binder, "sizeuint", qword);
+    let _ = alias(binder, "ptrint", int64);
+    let _ = alias(binder, "ptruint", qword);
     let boolean = primitive(
         binder,
         "boolean",
@@ -4762,9 +4901,13 @@ fn install_builtins(binder: &mut SemanticBinder) -> BuiltinTypes {
     );
     BuiltinTypes {
         integer,
+        long_integer,
         real,
         boolean,
         character,
+        byte,
+        word,
+        size_unsigned,
         nil,
         untyped_parameter,
     }
@@ -4814,6 +4957,7 @@ pub fn bind_sources_with_options(
     driver.bind_remaining_files(&inputs, &mut files);
     SemanticCompilation {
         binder: driver.binder,
+        builtin_families: driver.builtin_families,
         modules: driver.modules,
         files,
         bodies: driver.bodies,

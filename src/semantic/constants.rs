@@ -3,9 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{Literal, ModeSnapshot, Operator};
 
 use super::{
-    ApplicationSelection, ArgumentConversion, BoundApplicationTarget, BoundExpression,
-    BoundExpressionKind, BoundSetElement, ExplicitConversion, ResolvedConversion, SymbolId,
-    TypeRef, TypeRegistry, ValueConversionOperation,
+    ApplicationCandidate, ApplicationSelection, ArgumentConversion, BoundApplicationTarget,
+    BoundExpression, BoundExpressionKind, BoundSetElement, BuiltinInstantiation, BuiltinOperation,
+    ExplicitConversion, NumericOperation, OrdinalOperation, ResolvedConversion, SymbolId, TypeRef,
+    TypeRegistry, ValueConversionOperation,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,6 +26,22 @@ impl ConstantValue {
             Self::Integer(value) => Some(*value),
             Self::Boolean(value) => Some(*value as i128),
             Self::Character(value) => Some(*value as i128),
+            Self::String(_) | Self::Real(_) | Self::Nil | Self::Set(_) => None,
+        }
+    }
+
+    fn ordinal_variant(&self, value: i128) -> Option<Self> {
+        match self {
+            Self::Integer(_) => Some(Self::Integer(value)),
+            Self::Boolean(_) => match value {
+                0 => Some(Self::Boolean(false)),
+                1 => Some(Self::Boolean(true)),
+                _ => None,
+            },
+            Self::Character(_) => u32::try_from(value)
+                .ok()
+                .and_then(char::from_u32)
+                .map(Self::Character),
             Self::String(_) | Self::Real(_) | Self::Nil | Self::Set(_) => None,
         }
     }
@@ -139,7 +156,15 @@ impl<'a> ConstantEvaluator<'a> {
                 }
                 match target {
                     BoundApplicationTarget::Operator { operator, .. } => {
+                        if selected_builtin_operation(target).is_none() {
+                            return Err(ConstantEvaluationError::NotConstant);
+                        }
                         self.evaluate_operator(*operator, operands, expression.ty, expected, *modes)
+                    }
+                    BoundApplicationTarget::Builtin { .. } => {
+                        let operation = selected_builtin_operation(target)
+                            .ok_or(ConstantEvaluationError::UnresolvedApplication)?;
+                        self.evaluate_builtin(operation, operands, expected)
                     }
                     BoundApplicationTarget::Conversion { destination, .. } => {
                         let source = operands
@@ -213,6 +238,7 @@ impl<'a> ConstantEvaluator<'a> {
             }
             BoundExpressionKind::Member { .. }
             | BoundExpressionKind::TypeIdentifier { .. }
+            | BoundExpressionKind::TypeOperand { .. }
             | BoundExpressionKind::Inherited { .. }
             | BoundExpressionKind::Property { .. }
             | BoundExpressionKind::RoutineDesignator { .. }
@@ -221,6 +247,120 @@ impl<'a> ConstantEvaluator<'a> {
             | BoundExpressionKind::Index { .. }
             | BoundExpressionKind::Dereference(_)
             | BoundExpressionKind::Error => Err(ConstantEvaluationError::NotConstant),
+        }
+    }
+
+    fn evaluate_builtin(
+        &self,
+        operation: &BuiltinOperation,
+        operands: &[BoundExpression],
+        expected: Option<TypeRef>,
+    ) -> Result<ConstantEntry, ConstantEvaluationError> {
+        match operation {
+            BuiltinOperation::Metadata {
+                result_type,
+                constant: Some(value),
+                ..
+            } => {
+                let result_type = expected.unwrap_or(*result_type);
+                self.convert(
+                    ConstantEntry {
+                        ty: result_type,
+                        value: value.clone(),
+                    },
+                    result_type,
+                    ModeSnapshot::default(),
+                )
+            }
+            BuiltinOperation::Metadata { .. } | BuiltinOperation::StepMutation { .. } => {
+                Err(ConstantEvaluationError::NotConstant)
+            }
+            BuiltinOperation::Ordinal {
+                operation,
+                result_type,
+                modes,
+                ..
+            } => {
+                let source = operands
+                    .first()
+                    .ok_or(ConstantEvaluationError::InvalidOperand)?;
+                let source = self.evaluate(source, source.ty)?;
+                let ordinal = source
+                    .value
+                    .ordinal()
+                    .ok_or(ConstantEvaluationError::InvalidOperand)?;
+                let value = match operation {
+                    OrdinalOperation::Odd => ConstantValue::Boolean(ordinal & 1 != 0),
+                    OrdinalOperation::Ord => ConstantValue::Integer(ordinal),
+                    OrdinalOperation::Chr => {
+                        let code = u32::try_from(ordinal)
+                            .ok()
+                            .and_then(char::from_u32)
+                            .ok_or(ConstantEvaluationError::InvalidOperand)?;
+                        ConstantValue::Character(code)
+                    }
+                    OrdinalOperation::Pred => source
+                        .value
+                        .ordinal_variant(
+                            ordinal
+                                .checked_sub(1)
+                                .ok_or(ConstantEvaluationError::Overflow)?,
+                        )
+                        .ok_or(ConstantEvaluationError::InvalidOperand)?,
+                    OrdinalOperation::Succ => source
+                        .value
+                        .ordinal_variant(
+                            ordinal
+                                .checked_add(1)
+                                .ok_or(ConstantEvaluationError::Overflow)?,
+                        )
+                        .ok_or(ConstantEvaluationError::InvalidOperand)?,
+                };
+                let result_type = expected.unwrap_or(*result_type);
+                self.convert(
+                    ConstantEntry {
+                        ty: result_type,
+                        value,
+                    },
+                    result_type,
+                    *modes,
+                )
+            }
+            BuiltinOperation::Numeric {
+                operation,
+                result_type,
+                modes,
+                ..
+            } => {
+                let source = operands
+                    .first()
+                    .ok_or(ConstantEvaluationError::InvalidOperand)?;
+                let source = self.evaluate(source, source.ty)?;
+                let ordinal = source
+                    .value
+                    .ordinal()
+                    .ok_or(ConstantEvaluationError::InvalidOperand)?;
+                let value = match operation {
+                    NumericOperation::Abs => ordinal
+                        .checked_abs()
+                        .map(ConstantValue::Integer)
+                        .ok_or(ConstantEvaluationError::Overflow)?,
+                    NumericOperation::Sqr => ordinal
+                        .checked_mul(ordinal)
+                        .map(ConstantValue::Integer)
+                        .ok_or(ConstantEvaluationError::Overflow)?,
+                };
+                let result_type = expected.unwrap_or(*result_type);
+                self.convert(
+                    ConstantEntry {
+                        ty: result_type,
+                        value,
+                    },
+                    result_type,
+                    *modes,
+                )
+            }
+            BuiltinOperation::Operator { .. } => Err(ConstantEvaluationError::InvalidOperand),
         }
     }
 
@@ -383,6 +523,7 @@ fn application_selected(target: &BoundApplicationTarget) -> bool {
     let selection = match target {
         BoundApplicationTarget::Routine { resolution }
         | BoundApplicationTarget::CallableValue { resolution }
+        | BoundApplicationTarget::Builtin { resolution }
         | BoundApplicationTarget::Conversion { resolution, .. }
         | BoundApplicationTarget::Operator { resolution, .. } => &resolution.selection,
         BoundApplicationTarget::Invalid => return false,
@@ -394,6 +535,7 @@ fn application_uses_custom_conversion(target: &BoundApplicationTarget) -> bool {
     let resolution = match target {
         BoundApplicationTarget::Routine { resolution }
         | BoundApplicationTarget::CallableValue { resolution }
+        | BoundApplicationTarget::Builtin { resolution }
         | BoundApplicationTarget::Conversion { resolution, .. }
         | BoundApplicationTarget::Operator { resolution, .. } => resolution,
         BoundApplicationTarget::Invalid => return false,
@@ -406,6 +548,25 @@ fn application_uses_custom_conversion(target: &BoundApplicationTarget) -> bool {
                 .is_some_and(argument_conversion_uses_custom_operator)
         })
     })
+}
+
+fn selected_builtin_operation(target: &BoundApplicationTarget) -> Option<&BuiltinOperation> {
+    let resolution = match target {
+        BoundApplicationTarget::Routine { resolution }
+        | BoundApplicationTarget::CallableValue { resolution }
+        | BoundApplicationTarget::Builtin { resolution }
+        | BoundApplicationTarget::Conversion { resolution, .. }
+        | BoundApplicationTarget::Operator { resolution, .. } => resolution,
+        BoundApplicationTarget::Invalid => return None,
+    };
+    let ApplicationCandidate::Builtin {
+        instantiation: BuiltinInstantiation::Complete(instance),
+        ..
+    } = &resolution.selected_attempt()?.candidate
+    else {
+        return None;
+    };
+    Some(&instance.operation)
 }
 
 fn conversion_uses_custom_operator(conversion: &super::ConversionResolution) -> bool {

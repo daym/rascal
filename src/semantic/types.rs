@@ -515,6 +515,27 @@ impl TypeRegistry {
         self.implementation(ty)?.ordinal_base_type(self.query(ty))
     }
 
+    pub fn primitive_kind(&self, ty: TypeRef) -> Option<PrimitiveKind> {
+        self.implementation(self.canonical_type(ty))?
+            .as_any()
+            .downcast_ref::<PrimitiveType>()
+            .map(|primitive| primitive.kind)
+    }
+
+    pub fn static_sequence_length(&self, ty: TypeRef) -> Option<u64> {
+        let implementation = self.implementation(self.canonical_type(ty))?;
+        if let Some(literal) = implementation.as_any().downcast_ref::<StringLiteralType>() {
+            return Some(u64::from(literal.character_count));
+        }
+        let array = implementation.as_any().downcast_ref::<ArrayType>()?;
+        (!array.resizable && !array.open && array.layout.is_some())
+            .then(|| {
+                let domain = self.ordinal_domain(array.index)?;
+                u64::try_from(domain.upper.checked_sub(domain.lower)?.checked_add(1)?).ok()
+            })
+            .flatten()
+    }
+
     pub fn sequence_element_type(&self, ty: TypeRef) -> Option<TypeRef> {
         self.implementation(ty)?
             .sequence_element_type(self.query(ty))
@@ -1093,6 +1114,34 @@ impl PascalType for AliasType {
 
     fn is_subtype_of(&self, query: TypeQuery<'_>, target: TypeRef) -> bool {
         query.this == target || (!self.nominal && query.types.is_subtype(self.target, target))
+    }
+
+    fn sequence_element_type(&self, query: TypeQuery<'_>) -> Option<TypeRef> {
+        (!self.nominal)
+            .then(|| query.types.sequence_element_type(self.target))
+            .flatten()
+    }
+
+    fn array_element_type(&self, query: TypeQuery<'_>) -> Option<TypeRef> {
+        (!self.nominal)
+            .then(|| query.types.array_element_type(self.target))
+            .flatten()
+    }
+
+    fn sequence_index_type(&self, query: TypeQuery<'_>) -> Option<TypeRef> {
+        (!self.nominal)
+            .then(|| query.types.sequence_index_type(self.target))
+            .flatten()
+    }
+
+    fn sequence_length_type(&self, query: TypeQuery<'_>) -> Option<TypeRef> {
+        (!self.nominal)
+            .then(|| query.types.sequence_length_type(self.target))
+            .flatten()
+    }
+
+    fn sequence_is_resizable(&self, query: TypeQuery<'_>) -> bool {
+        !self.nominal && query.types.sequence_is_resizable(self.target)
     }
 
     fn member_environment(&self, query: TypeQuery<'_>) -> Option<EnvironmentId> {

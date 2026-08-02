@@ -1,4 +1,6 @@
-use rascal::semantic::{ConstantValue, LookupRequest, SymbolKind, TypeRef, bind_sources};
+use rascal::semantic::{
+    BuiltinContract, ConstantValue, LookupRequest, MetadataQuery, SymbolKind, TypeRef, bind_sources,
+};
 
 fn lookup_type(compilation: &rascal::semantic::SemanticCompilation, spelling: &str) -> TypeRef {
     let environment = compilation.files[0].environment;
@@ -22,6 +24,32 @@ fn lookup_type(compilation: &rascal::semantic::SemanticCompilation, spelling: &s
         panic!("expected type symbol")
     };
     ty
+}
+
+fn lookup_constant<'a>(
+    compilation: &'a rascal::semantic::SemanticCompilation,
+    spelling: &str,
+) -> &'a ConstantValue {
+    let environment = compilation.files[0].environment;
+    let name = compilation
+        .binder
+        .scopes
+        .names()
+        .lookup(spelling)
+        .expect("interned constant name");
+    let symbol = compilation
+        .binder
+        .scopes
+        .lookup_symbol(environment, name, LookupRequest::REQUIRED_VALUE)
+        .expect("visible constant")
+        .primary[0]
+        .symbol;
+    &compilation
+        .binder
+        .constants
+        .get(symbol)
+        .expect("evaluated constant")
+        .value
 }
 
 #[test]
@@ -141,5 +169,98 @@ fn typed_constant_conversion_uses_the_declaration_range_mode_snapshot() {
             .any(|diagnostic| diagnostic.message.contains("OutsideOrdinalDomain")),
         "{:#?}",
         compilation.diagnostics
+    );
+}
+
+#[test]
+fn parameterized_builtin_contracts_share_constant_and_runtime_binding() {
+    let source = "
+        program BuiltinContracts;
+        type
+          TIndex = 2..5;
+          TItems = array[TIndex] of Byte;
+        const
+          SignedLow = Low(Int64);
+          SignedHigh = High(Int64);
+          UnsignedHigh = High(QWord);
+          ItemLow = Low(TItems);
+          ItemHigh = High(TItems);
+          Int64Bytes = SizeOf(Int64);
+          FiveIsOdd = Odd(5);
+          NextValue = Succ(4);
+          SquareValue = Sqr(6);
+        var
+          RuntimeValue: Int64;
+          Items: TItems;
+        begin
+          RuntimeValue := High(Int64);
+          RuntimeValue := Pred(RuntimeValue);
+          Inc(RuntimeValue);
+          if Odd(RuntimeValue) then
+            RuntimeValue := Low(Int64);
+          RuntimeValue := Length(Items);
+        end.
+    ";
+    let compilation = bind_sources(&[("builtin_contracts.pp", source)]);
+    assert!(
+        compilation.diagnostics.is_empty(),
+        "{:#?}",
+        compilation.diagnostics
+    );
+    assert_eq!(
+        lookup_constant(&compilation, "signedlow"),
+        &ConstantValue::Integer(i64::MIN.into())
+    );
+    assert_eq!(
+        lookup_constant(&compilation, "signedhigh"),
+        &ConstantValue::Integer(i64::MAX.into())
+    );
+    assert_eq!(
+        lookup_constant(&compilation, "unsignedhigh"),
+        &ConstantValue::Integer(u64::MAX.into())
+    );
+    assert_eq!(
+        lookup_constant(&compilation, "itemlow"),
+        &ConstantValue::Integer(2)
+    );
+    assert_eq!(
+        lookup_constant(&compilation, "itemhigh"),
+        &ConstantValue::Integer(5)
+    );
+    assert_eq!(
+        lookup_constant(&compilation, "int64bytes"),
+        &ConstantValue::Integer(8)
+    );
+    assert_eq!(
+        lookup_constant(&compilation, "fiveisodd"),
+        &ConstantValue::Boolean(true)
+    );
+    assert_eq!(
+        lookup_constant(&compilation, "nextvalue"),
+        &ConstantValue::Integer(5)
+    );
+    assert_eq!(
+        lookup_constant(&compilation, "squarevalue"),
+        &ConstantValue::Integer(36)
+    );
+    let high_name = compilation.binder.scopes.names().lookup("high").unwrap();
+    let high_symbol = compilation
+        .binder
+        .scopes
+        .lookup_symbol(
+            compilation.files[0].environment,
+            high_name,
+            LookupRequest::ORDINARY,
+        )
+        .unwrap()
+        .primary[0]
+        .symbol;
+    let SymbolKind::Builtin(high_family) = compilation.binder.scopes.symbol(high_symbol).kind
+    else {
+        panic!("System.High must be a parameterized builtin declaration")
+    };
+    assert_eq!(
+        compilation.builtin_families.get(high_family).contract,
+        BuiltinContract::Metadata(MetadataQuery::High)
     );
 }

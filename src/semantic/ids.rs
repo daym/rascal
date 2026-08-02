@@ -32,3 +32,4 @@ semantic_id!(SymbolId);
 semantic_id!(TypeRef);
 semantic_id!(TypeSectionId);
 semantic_id!(ModuleId);
+semantic_id!(BuiltinFamilyId);

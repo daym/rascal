@@ -1,6 +1,7 @@
 use super::{
-    CallableFlavor, ConstantValue, ConversionResolution, ConversionResolver, ConversionSelection,
-    ParameterMode, ReceiverId, ResolvedConversion, SemanticUse, SymbolId, TypeRef, TypeRegistry,
+    BuiltinFamilyId, BuiltinInstantiation, BuiltinOperandForm, BuiltinRejection, CallableFlavor,
+    ConstantValue, ConversionResolution, ConversionResolver, ConversionSelection, ParameterMode,
+    ReceiverId, ResolvedConversion, RoutineSignature, SemanticUse, SymbolId, TypeRef, TypeRegistry,
     ValueConversion,
 };
 
@@ -28,6 +29,11 @@ pub enum ApplicationCandidate {
         callable_type: TypeRef,
         receiver: ApplicationReceiver,
     },
+    Builtin {
+        symbol: SymbolId,
+        family: BuiltinFamilyId,
+        instantiation: BuiltinInstantiation,
+    },
     Conversion {
         destination: TypeRef,
     },
@@ -39,7 +45,7 @@ impl ApplicationCandidate {
             Self::Routine { callable_type, .. } | Self::CallableValue { callable_type, .. } => {
                 Some(*callable_type)
             }
-            Self::Conversion { .. } => None,
+            Self::Builtin { .. } | Self::Conversion { .. } => None,
         }
     }
 
@@ -47,6 +53,7 @@ impl ApplicationCandidate {
         match self {
             Self::Routine { symbol, .. } => Some(*symbol),
             Self::CallableValue { symbol, .. } => *symbol,
+            Self::Builtin { symbol, .. } => Some(*symbol),
             Self::Conversion { .. } => None,
         }
     }
@@ -54,13 +61,20 @@ impl ApplicationCandidate {
     pub const fn receiver(&self) -> ApplicationReceiver {
         match self {
             Self::Routine { receiver, .. } | Self::CallableValue { receiver, .. } => *receiver,
-            Self::Conversion { .. } => ApplicationReceiver::None,
+            Self::Builtin { .. } | Self::Conversion { .. } => ApplicationReceiver::None,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActualArgumentForm {
+    Value,
+    Type,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActualArgument {
+    pub form: ActualArgumentForm,
     pub ty: Option<TypeRef>,
     pub addressable: bool,
 }
@@ -130,6 +144,7 @@ pub enum CandidateRejection {
         source: TypeRef,
         attempts: Vec<usize>,
     },
+    Builtin(BuiltinRejection),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -263,6 +278,27 @@ impl<'a> ApplicationResolver<'a> {
             | ApplicationCandidate::CallableValue { callable_type, .. } => {
                 self.attempt_callable(candidate, callable_type, actuals)
             }
+            ApplicationCandidate::Builtin {
+                instantiation: BuiltinInstantiation::Complete(ref instance),
+                ..
+            } => {
+                let signature = instance.signature.clone();
+                let operand_forms = instance.operand_forms.clone();
+                self.attempt_signature(candidate, &signature, Some(&operand_forms), actuals)
+            }
+            ApplicationCandidate::Builtin {
+                instantiation: BuiltinInstantiation::Rejected(ref rejection),
+                ..
+            } => {
+                let rejection = rejection.clone();
+                CandidateAttempt {
+                    candidate,
+                    arguments: Vec::new(),
+                    defaults: Vec::new(),
+                    result_type: None,
+                    rejections: vec![CandidateRejection::Builtin(rejection)],
+                }
+            }
             ApplicationCandidate::Conversion { destination } => {
                 self.attempt_conversion(candidate, destination, actuals)
             }
@@ -286,13 +322,25 @@ impl<'a> ApplicationResolver<'a> {
             };
         };
         validate_receiver(&candidate, callable.flavor, callable_type, &mut rejections);
-        let minimum = callable
-            .signature
+        let mut attempt = self.attempt_signature(candidate, &callable.signature, None, actuals);
+        attempt.rejections.splice(0..0, rejections);
+        attempt
+    }
+
+    fn attempt_signature(
+        &self,
+        candidate: ApplicationCandidate,
+        signature: &RoutineSignature,
+        operand_forms: Option<&[BuiltinOperandForm]>,
+        actuals: &[ActualArgument],
+    ) -> CandidateAttempt {
+        let mut rejections = Vec::new();
+        let minimum = signature
             .parameters
             .iter()
             .rposition(|parameter| parameter.default.is_none())
             .map_or(0, |index| index + 1);
-        let maximum = callable.signature.parameters.len();
+        let maximum = signature.parameters.len();
         if actuals.len() < minimum || actuals.len() > maximum {
             rejections.push(CandidateRejection::Arity {
                 provided: actuals.len(),
@@ -302,13 +350,16 @@ impl<'a> ApplicationResolver<'a> {
         }
 
         let mut arguments = Vec::new();
-        for (actual_index, (formal, actual)) in callable
-            .signature
-            .parameters
-            .iter()
-            .zip(actuals)
-            .enumerate()
+        for (actual_index, (formal, actual)) in signature.parameters.iter().zip(actuals).enumerate()
         {
+            let expected_form = operand_forms
+                .and_then(|forms| forms.get(actual_index))
+                .copied()
+                .unwrap_or(BuiltinOperandForm::Value);
+            let actual_form = match actual.form {
+                ActualArgumentForm::Value => BuiltinOperandForm::Value,
+                ActualArgumentForm::Type => BuiltinOperandForm::Type,
+            };
             let Some(actual_type) = actual.ty else {
                 rejections.push(CandidateRejection::MissingActualType { actual_index });
                 arguments.push(ArgumentBinding {
@@ -320,7 +371,26 @@ impl<'a> ApplicationResolver<'a> {
                 });
                 continue;
             };
-            let conversion = if formal.ty == self.untyped_parameter {
+            let conversion = if actual_form != expected_form {
+                rejections.push(CandidateRejection::Builtin(match expected_form {
+                    BuiltinOperandForm::Value => {
+                        BuiltinRejection::ExpectedValueOperand { actual_index }
+                    }
+                    BuiltinOperandForm::Type => {
+                        BuiltinRejection::ExpectedTypeOperand { actual_index }
+                    }
+                }));
+                None
+            } else if expected_form == BuiltinOperandForm::Type {
+                if self.types.canonical_type(formal.ty) != self.types.canonical_type(actual_type) {
+                    rejections.push(CandidateRejection::FormalContractMismatch {
+                        actual_index,
+                        formal: formal.ty,
+                        actual: actual_type,
+                    });
+                }
+                None
+            } else if formal.ty == self.untyped_parameter {
                 if !actual.addressable {
                     rejections.push(CandidateRejection::ArgumentNotAddressable {
                         actual_index,
@@ -389,7 +459,7 @@ impl<'a> ApplicationResolver<'a> {
             });
         }
         let defaults = if actuals.len() <= maximum {
-            callable.signature.parameters[actuals.len()..]
+            signature.parameters[actuals.len()..]
                 .iter()
                 .enumerate()
                 .filter_map(|(offset, formal)| {
@@ -407,7 +477,7 @@ impl<'a> ApplicationResolver<'a> {
             candidate,
             arguments,
             defaults,
-            result_type: callable.signature.result,
+            result_type: signature.result,
             rejections,
         }
     }
@@ -525,7 +595,7 @@ fn validate_receiver(
                 }
             }
         },
-        ApplicationCandidate::Conversion { .. } => {}
+        ApplicationCandidate::Builtin { .. } | ApplicationCandidate::Conversion { .. } => {}
     }
 }
 
@@ -646,6 +716,7 @@ mod tests {
                 },
             ],
             &[ActualArgument {
+                form: ActualArgumentForm::Value,
                 ty: Some(scalar),
                 addressable: false,
             }],

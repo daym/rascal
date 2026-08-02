@@ -208,6 +208,10 @@ pub enum BoundExpressionKind {
         symbol: SymbolId,
         instance_type: TypeRef,
     },
+    TypeOperand {
+        symbol: SymbolId,
+        represented_type: TypeRef,
+    },
     Inherited {
         symbols: Vec<SymbolId>,
         forward_parameters: bool,
@@ -249,6 +253,9 @@ pub enum BoundApplicationTarget {
         resolution: ApplicationResolution,
     },
     CallableValue {
+        resolution: ApplicationResolution,
+    },
+    Builtin {
         resolution: ApplicationResolution,
     },
     Conversion {

@@ -1,5 +1,6 @@
 pub mod application;
 pub mod binder;
+pub mod builtins;
 pub mod constants;
 pub mod conversion;
 pub mod expressions;
@@ -10,13 +11,18 @@ pub mod scope;
 pub mod types;
 
 pub use application::{
-    ActualArgument, ApplicationCandidate, ApplicationReceiver, ApplicationResolution,
-    ApplicationResolver, ApplicationSelection, ArgumentBinding, ArgumentConversion,
-    CandidateAttempt, CandidateRejection, DefaultArgumentBinding,
+    ActualArgument, ActualArgumentForm, ApplicationCandidate, ApplicationReceiver,
+    ApplicationResolution, ApplicationResolver, ApplicationSelection, ArgumentBinding,
+    ArgumentConversion, CandidateAttempt, CandidateRejection, DefaultArgumentBinding,
 };
 pub use binder::{
     AggregateDefinition, AggregateKind, BindError, DeclaredRoutine, DeclaredType,
     RoutineBodyCheckpoint, SemanticBinder, UnresolvedTypeForward,
+};
+pub use builtins::{
+    BuiltinActual, BuiltinContract, BuiltinFamilyDecl, BuiltinInstance, BuiltinInstantiation,
+    BuiltinOperandForm, BuiltinOperation, BuiltinRegistry, BuiltinRejection, BuiltinTypeContext,
+    MetadataQuery, NumericOperation, OrdinalOperation, StepOperation,
 };
 pub use constants::{
     ConstantEntry, ConstantEvaluationError, ConstantEvaluator, ConstantRegistry, ConstantValue,
@@ -34,8 +40,8 @@ pub use expressions::{
 };
 pub use frontend::{BoundFile, SemanticCompilation, bind_sources, bind_sources_with_options};
 pub use ids::{
-    DeclId, EnvironmentId, ModuleId, NameId, NodeId, ReceiverId, RegionId, StorageId, SymbolId,
-    TypeRef, TypeSectionId,
+    BuiltinFamilyId, DeclId, EnvironmentId, ModuleId, NameId, NodeId, ReceiverId, RegionId,
+    StorageId, SymbolId, TypeRef, TypeSectionId,
 };
 pub use modules::{
     ModuleGraphError, ModuleInfo, ModulePhase, ModuleRegistry, create_module_export_environment,

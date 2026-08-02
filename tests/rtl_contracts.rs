@@ -2,7 +2,8 @@ use rascal::{
     declaration_ast::{DeclarationSyntax, RoutineSyntaxKind, TypeSyntaxKind},
     declaration_parser, lex, pascal_parser,
     semantic::{
-        BuiltinContract, LookupRequest, MetadataQuery, RegionOwner, SymbolKind, bind_sources,
+        BuiltinContract, ConstantValue, FormalTypeKind, LookupRequest, MetadataQuery, RegionOwner,
+        SetMutationOperation, SymbolKind, bind_sources,
     },
 };
 
@@ -177,8 +178,192 @@ fn bundled_system_is_source_bound_and_intrinsic_metadata_uses_its_symbol() {
         .builtin_families
         .family_for_symbol(high_symbol)
         .expect("source-declared System.High carries intrinsic metadata");
+    let family = compilation.builtin_families.get(family);
+    assert_eq!(
+        family.contract,
+        BuiltinContract::Metadata(MetadataQuery::High)
+    );
+    assert_eq!(family.external_selector, "::u_system::p_high");
+    assert_eq!(family.omitted_formals, vec![true]);
+}
+
+#[test]
+fn external_selector_not_pascal_spelling_selects_the_builtin_handler() {
+    let compilation = bind_sources(&[(
+        "external_selector.pp",
+        "
+        program ExternalSelector;
+        function Ceiling(const x): Integer;
+          external name '::u_system::p_high';
+        const LastByte = Ceiling(Byte);
+        begin end.
+        ",
+    )]);
+    assert!(
+        compilation.diagnostics.is_empty(),
+        "{:#?}",
+        compilation.diagnostics
+    );
+    let environment = compilation.files[0].environment;
+    let ceiling = compilation.binder.scopes.names().lookup("ceiling").unwrap();
+    let symbol = compilation
+        .binder
+        .scopes
+        .lookup_symbol(environment, ceiling, LookupRequest::ORDINARY)
+        .unwrap()
+        .primary[0]
+        .symbol;
+    let family = compilation
+        .builtin_families
+        .family_for_symbol(symbol)
+        .expect("external selector attaches the High handler");
     assert_eq!(
         compilation.builtin_families.get(family).contract,
         BuiltinContract::Metadata(MetadataQuery::High)
     );
+    let last_byte = compilation
+        .binder
+        .scopes
+        .names()
+        .lookup("lastbyte")
+        .unwrap();
+    let constant = compilation
+        .binder
+        .scopes
+        .lookup_symbol(environment, last_byte, LookupRequest::ORDINARY)
+        .unwrap()
+        .primary[0]
+        .symbol;
+    assert_eq!(
+        compilation.binder.constants.get(constant).unwrap().value,
+        ConstantValue::Integer(u8::MAX.into())
+    );
+}
+
+#[test]
+fn omitted_formals_are_explicit_and_do_not_compare_against_a_fake_type() {
+    let compilation = bind_sources(&[(
+        "untyped_external.pp",
+        "
+        program UntypedExternal;
+        procedure Inspect(const x); external name 'backend_inspect';
+        procedure Mutate(var x); external name 'backend_mutate';
+        var Value: LongInt;
+        begin
+          Inspect(1);
+          Mutate(Value);
+        end.
+        ",
+    )]);
+    assert!(
+        compilation.diagnostics.is_empty(),
+        "{:#?}",
+        compilation.diagnostics
+    );
+    let environment = compilation.files[0].environment;
+    for spelling in ["inspect", "mutate"] {
+        let name = compilation.binder.scopes.names().lookup(spelling).unwrap();
+        let symbol = compilation
+            .binder
+            .scopes
+            .lookup_symbol(environment, name, LookupRequest::ORDINARY)
+            .unwrap()
+            .primary[0]
+            .symbol;
+        let SymbolKind::Routine(callable) = compilation.binder.scopes.symbol(symbol).kind else {
+            panic!("{spelling} must be a routine")
+        };
+        assert_eq!(
+            compilation
+                .binder
+                .types
+                .callable(callable)
+                .unwrap()
+                .signature
+                .parameters[0]
+                .type_kind,
+            FormalTypeKind::Omitted
+        );
+        assert!(
+            compilation
+                .builtin_families
+                .family_for_symbol(symbol)
+                .is_none(),
+            "an unknown backend selector must not manufacture a builtin"
+        );
+    }
+
+    let rejected = bind_sources(&[(
+        "untyped_var_literal.pp",
+        "
+        program UntypedVarLiteral;
+        procedure Mutate(var x); external name 'backend_mutate';
+        begin
+          Mutate(1);
+        end.
+        ",
+    )]);
+    assert!(rejected.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("no viable overload for `mutate`")
+    }));
+}
+
+#[test]
+fn selector_handler_supplies_relationships_omitted_from_pascal_formals() {
+    let valid = bind_sources(&[(
+        "set_mutation.pp",
+        "
+        program SetMutation;
+        type
+          TIndex = 0..7;
+          TValues = set of TIndex;
+        var
+          Values: TValues;
+          Element: TIndex;
+        begin
+          Include(Values, Element);
+          Exclude(Values, Element);
+        end.
+        ",
+    )]);
+    assert!(valid.diagnostics.is_empty(), "{:#?}", valid.diagnostics);
+    let include = valid.binder.scopes.names().lookup("include").unwrap();
+    let symbol = valid
+        .binder
+        .scopes
+        .lookup_symbol(valid.files[0].environment, include, LookupRequest::ORDINARY)
+        .unwrap()
+        .primary[0]
+        .symbol;
+    let family = valid
+        .builtin_families
+        .family_for_symbol(symbol)
+        .expect("p_include selects the set relationship handler");
+    assert_eq!(
+        valid.builtin_families.get(family).contract,
+        BuiltinContract::SetMutation(SetMutationOperation::Include)
+    );
+
+    let invalid = bind_sources(&[(
+        "bad_set_mutation.pp",
+        "
+        program BadSetMutation;
+        type
+          TIndex = 0..7;
+          TValues = set of TIndex;
+        var
+          Values: TValues;
+          Item: Pointer;
+        begin
+          Include(Values, Item);
+        end.
+        ",
+    )]);
+    assert!(invalid.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("no viable overload for `include`")
+    }));
 }

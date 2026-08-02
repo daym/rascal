@@ -272,9 +272,9 @@ impl<'a> ConstantEvaluator<'a> {
                     ModeSnapshot::default(),
                 )
             }
-            BuiltinOperation::Metadata { .. } | BuiltinOperation::StepMutation { .. } => {
-                Err(ConstantEvaluationError::NotConstant)
-            }
+            BuiltinOperation::Metadata { .. }
+            | BuiltinOperation::StepMutation { .. }
+            | BuiltinOperation::SetMutation { .. } => Err(ConstantEvaluationError::NotConstant),
             BuiltinOperation::Ordinal {
                 operation,
                 result_type,

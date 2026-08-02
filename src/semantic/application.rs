@@ -1,8 +1,8 @@
 use super::{
     BuiltinFamilyId, BuiltinInstantiation, BuiltinOperandForm, BuiltinRejection, CallableFlavor,
-    ConstantValue, ConversionResolution, ConversionResolver, ConversionSelection, ParameterMode,
-    ReceiverId, ResolvedConversion, RoutineSignature, SemanticUse, SymbolId, TypeRef, TypeRegistry,
-    ValueConversion,
+    ConstantValue, ConversionResolution, ConversionResolver, ConversionSelection, FormalTypeKind,
+    ParameterMode, ReceiverId, ResolvedConversion, RoutineSignature, SemanticUse, SymbolId,
+    TypeRef, TypeRegistry, ValueConversion,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +91,7 @@ pub struct ArgumentBinding {
     pub actual_index: usize,
     pub formal_index: usize,
     pub formal_type: TypeRef,
+    pub formal_type_kind: FormalTypeKind,
     pub required_use: SemanticUse,
     pub conversion: Option<ArgumentConversion>,
 }
@@ -211,21 +212,12 @@ impl ApplicationResolution {
 
 pub struct ApplicationResolver<'a> {
     types: &'a TypeRegistry,
-    untyped_parameter: TypeRef,
     conversions: &'a ConversionResolver<'a>,
 }
 
 impl<'a> ApplicationResolver<'a> {
-    pub const fn new(
-        types: &'a TypeRegistry,
-        untyped_parameter: TypeRef,
-        conversions: &'a ConversionResolver<'a>,
-    ) -> Self {
-        Self {
-            types,
-            untyped_parameter,
-            conversions,
-        }
+    pub const fn new(types: &'a TypeRegistry, conversions: &'a ConversionResolver<'a>) -> Self {
+        Self { types, conversions }
     }
 
     pub fn resolve(
@@ -366,6 +358,7 @@ impl<'a> ApplicationResolver<'a> {
                     actual_index,
                     formal_index: actual_index,
                     formal_type: formal.ty,
+                    formal_type_kind: formal.type_kind,
                     required_use: formal_semantic_use(formal.mode),
                     conversion: None,
                 });
@@ -390,8 +383,12 @@ impl<'a> ApplicationResolver<'a> {
                     });
                 }
                 None
-            } else if formal.ty == self.untyped_parameter {
-                if !actual.addressable {
+            } else if formal.type_kind == FormalTypeKind::Omitted {
+                let reference_required = matches!(
+                    formal.mode,
+                    ParameterMode::Var | ParameterMode::Out | ParameterMode::ConstRef
+                );
+                if reference_required && !actual.addressable {
                     rejections.push(CandidateRejection::ArgumentNotAddressable {
                         actual_index,
                         mode: formal.mode,
@@ -400,7 +397,11 @@ impl<'a> ApplicationResolver<'a> {
                 } else {
                     Some(ArgumentConversion::Storage(ValueConversion {
                         rank: super::ConversionRank::Compatible,
-                        operation: super::ValueConversionOperation::UntypedStorage,
+                        operation: if actual.addressable {
+                            super::ValueConversionOperation::UntypedStorage
+                        } else {
+                            super::ValueConversionOperation::UntypedValue
+                        },
                         range_check: super::RangeCheck::None,
                     }))
                 }
@@ -454,6 +455,7 @@ impl<'a> ApplicationResolver<'a> {
                 actual_index,
                 formal_index: actual_index,
                 formal_type: formal.ty,
+                formal_type_kind: formal.type_kind,
                 required_use: formal_semantic_use(formal.mode),
                 conversion,
             });
@@ -524,6 +526,7 @@ impl<'a> ApplicationResolver<'a> {
                     actual_index: 0,
                     formal_index: 0,
                     formal_type: destination,
+                    formal_type_kind: FormalTypeKind::Declared,
                     required_use: SemanticUse::Value,
                     conversion,
                 });
@@ -533,6 +536,7 @@ impl<'a> ApplicationResolver<'a> {
                     actual_index: 0,
                     formal_index: 0,
                     formal_type: destination,
+                    formal_type_kind: FormalTypeKind::Declared,
                     required_use: SemanticUse::Value,
                     conversion: None,
                 });
@@ -662,6 +666,7 @@ mod tests {
                         .map(|(ty, has_default)| FormalParameter {
                             mode: ParameterMode::Value,
                             ty: *ty,
+                            type_kind: FormalTypeKind::Declared,
                             default: has_default.then_some(ConstantValue::Integer(0)),
                         })
                         .collect(),
@@ -702,7 +707,7 @@ mod tests {
             scopes.current_environment(),
             crate::ModeSnapshot::default(),
         );
-        let resolution = ApplicationResolver::new(&types, TypeRef(999), &conversions).resolve(
+        let resolution = ApplicationResolver::new(&types, &conversions).resolve(
             vec![
                 ApplicationCandidate::Routine {
                     symbol: SymbolId(0),

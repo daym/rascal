@@ -24,20 +24,19 @@ use super::{
     ApplicationSelection, ArrayType, BindError, BoundApplicationTarget, BoundAssignment, BoundBody,
     BoundCaseArm, BoundCaseLabel, BoundExceptionHandler, BoundExpression, BoundExpressionKind,
     BoundPropertyBinding, BoundSetElement, BoundStatement, BoundStatementKind,
-    BoundTryContinuation, BuiltinActual, BuiltinContract, BuiltinFamilyDecl, BuiltinOperandForm,
-    BuiltinRegistry, BuiltinTypeContext, CallableFlavor, CallableType, CallingConvention, Capture,
-    ConstantEntry, ConstantEvaluator, ConstantValue, ConversionResolution, ConversionResolver,
+    BoundTryContinuation, BuiltinActual, BuiltinFamilyDecl, BuiltinOperandForm, BuiltinRegistry,
+    BuiltinTypeContext, CallableFlavor, CallableType, CallingConvention, Capture, ConstantEntry,
+    ConstantEvaluator, ConstantValue, ConversionResolution, ConversionResolver,
     ConversionSelection, DeclarationMode, DeclarationState, DeclaredRoutine, EnumMember, EnumType,
     EnvironmentId, EnvironmentRequirement, ExpressionCategory, FieldLayout, FormalParameter,
-    FrameKind, IncompleteReason, LookupBarrier, LookupEdge, LookupRequest, LookupResult,
-    MetadataQuery, MethodDispatch, MethodMetadata, ModuleGraphError, ModuleId, ModulePhase,
-    ModuleRegistry, NameId, NilType, NodeId, NumericOperation, OpaqueType, OrdinalDomain,
-    OrdinalOperation, ParameterMode, PointerType, PrimitiveKind, PrimitiveType, PropertyAccessKind,
-    PropertyAccessor, PropertySymbol, RawMethodType, ReceiverId, RegionOwner, RoutineOwner,
-    RoutineSignature, SemanticBinder, SemanticUse, SetType, StepOperation, StorageLayout,
-    StringKind, StringLiteralType, StringType, SubrangeType, SymbolCategory, SymbolFilter,
-    SymbolId, SymbolKind, TypeOwner, TypeRef, UnitType, UntypedPointerType, VariantAlternative,
-    VariantPart,
+    FormalTypeKind, FrameKind, IncompleteReason, LookupBarrier, LookupEdge, LookupRequest,
+    LookupResult, MethodDispatch, MethodMetadata, ModuleGraphError, ModuleId, ModulePhase,
+    ModuleRegistry, NameId, NilType, NodeId, OpaqueType, OrdinalDomain, ParameterMode, PointerType,
+    PrimitiveKind, PrimitiveType, PropertyAccessKind, PropertyAccessor, PropertySymbol,
+    RawMethodType, ReceiverId, RegionOwner, RoutineOwner, RoutineSignature, SemanticBinder,
+    SemanticUse, SetType, StorageLayout, StringKind, StringLiteralType, StringType, SubrangeType,
+    SymbolCategory, SymbolFilter, SymbolId, SymbolKind, TypeOwner, TypeRef, UnitType,
+    UntypedPointerType, VariantAlternative, VariantPart, builtin_contract_for_external_selector,
 };
 
 #[derive(Clone, Debug)]
@@ -1312,6 +1311,7 @@ impl CompilationDriver {
             write_parameters.push(FormalParameter {
                 mode: ParameterMode::Value,
                 ty,
+                type_kind: FormalTypeKind::Declared,
                 default: None,
             });
             self.allocate_anonymous(contract(None, write_parameters))
@@ -1447,9 +1447,7 @@ impl CompilationDriver {
         let Some(declared) = declared else {
             return;
         };
-        if self.binding_system {
-            self.attach_system_builtin(routine, declared);
-        }
+        self.attach_external_builtin(routine, declared);
         if routine.is_forward && !routine.is_external {
             self.routine_forwards.insert(key, declared);
         }
@@ -1458,44 +1456,28 @@ impl CompilationDriver {
         }
     }
 
-    fn attach_system_builtin(
+    fn attach_external_builtin(
         &mut self,
         routine: &RoutineDeclarationSyntax,
         declared: DeclaredRoutine,
     ) {
-        let canonical_name = self
-            .binder
-            .scopes
-            .names()
-            .spelling(self.binder.scopes.symbol(declared.symbol).name);
-        let generic = routine
-            .parameters
-            .iter()
-            .any(|parameter| parameter.ty.is_none());
-        let contract = if routine.kind == RoutineSyntaxKind::Operator {
-            system_operator_contract(canonical_name)
-        } else {
-            match canonical_name {
-                "low" => Some(BuiltinContract::Metadata(MetadataQuery::Low)),
-                "high" => Some(BuiltinContract::Metadata(MetadataQuery::High)),
-                "sizeof" => Some(BuiltinContract::Metadata(MetadataQuery::SizeOf)),
-                "length" if generic => Some(BuiltinContract::Metadata(MetadataQuery::Length)),
-                "odd" => Some(BuiltinContract::Ordinal(OrdinalOperation::Odd)),
-                "ord" => Some(BuiltinContract::Ordinal(OrdinalOperation::Ord)),
-                "chr" => Some(BuiltinContract::Ordinal(OrdinalOperation::Chr)),
-                "pred" => Some(BuiltinContract::Ordinal(OrdinalOperation::Pred)),
-                "succ" => Some(BuiltinContract::Ordinal(OrdinalOperation::Succ)),
-                "abs" => Some(BuiltinContract::Numeric(NumericOperation::Abs)),
-                "sqr" => Some(BuiltinContract::Numeric(NumericOperation::Sqr)),
-                "inc" => Some(BuiltinContract::StepMutation(StepOperation::Increment)),
-                "dec" => Some(BuiltinContract::StepMutation(StepOperation::Decrement)),
-                _ => None,
-            }
-        };
-        let Some(contract) = contract else {
+        let Some(external_selector) = routine.external_name.as_deref() else {
             return;
         };
-        let declared_signature = (!generic).then(|| {
+        let omitted_formals = routine
+            .parameters
+            .iter()
+            .flat_map(|parameter| {
+                std::iter::repeat_n(parameter.ty.is_none(), parameter.names.len())
+            })
+            .collect::<Vec<_>>();
+        let has_omitted_formals = omitted_formals.iter().any(|omitted| *omitted);
+        let Some(contract) =
+            builtin_contract_for_external_selector(external_selector, has_omitted_formals)
+        else {
+            return;
+        };
+        let declared_signature = (!has_omitted_formals).then(|| {
             self.binder
                 .types
                 .callable(declared.ty)
@@ -1506,7 +1488,9 @@ impl CompilationDriver {
         self.builtin_families.attach(
             declared.symbol,
             BuiltinFamilyDecl {
+                external_selector: external_selector.to_owned(),
                 contract,
+                omitted_formals,
                 declared_signature,
             },
         );
@@ -1904,7 +1888,11 @@ impl CompilationDriver {
                 .default
                 .as_ref()
                 .and_then(|default| {
-                    self.evaluate_constant_expression_with_modes(default, Some(ty), parameter.modes)
+                    self.evaluate_constant_expression_with_modes(
+                        default,
+                        parameter.ty.as_ref().map(|_| ty),
+                        parameter.modes,
+                    )
                 })
                 .map(|entry| entry.value);
             for name in &parameter.names {
@@ -1913,6 +1901,11 @@ impl CompilationDriver {
                 formals.push(FormalParameter {
                     mode,
                     ty,
+                    type_kind: if parameter.ty.is_some() {
+                        FormalTypeKind::Declared
+                    } else {
+                        FormalTypeKind::Omitted
+                    },
                     default: default.clone(),
                 });
             }
@@ -1955,13 +1948,22 @@ impl CompilationDriver {
                 .default
                 .as_ref()
                 .and_then(|default| {
-                    self.evaluate_constant_expression_with_modes(default, Some(ty), parameter.modes)
+                    self.evaluate_constant_expression_with_modes(
+                        default,
+                        parameter.ty.as_ref().map(|_| ty),
+                        parameter.modes,
+                    )
                 })
                 .map(|entry| entry.value);
             for _ in &parameter.names {
                 formals.push(FormalParameter {
                     mode,
                     ty,
+                    type_kind: if parameter.ty.is_some() {
+                        FormalTypeKind::Declared
+                    } else {
+                        FormalTypeKind::Omitted
+                    },
                     default: default.clone(),
                 });
             }
@@ -4247,12 +4249,7 @@ impl CompilationDriver {
             self.binder.scopes.current_environment(),
             modes,
         );
-        ApplicationResolver::new(
-            &self.binder.types,
-            self.builtins.untyped_parameter,
-            &conversions,
-        )
-        .resolve(candidates, &actuals)
+        ApplicationResolver::new(&self.binder.types, &conversions).resolve(candidates, &actuals)
     }
 
     fn apply_implicit_conversion(
@@ -4623,36 +4620,6 @@ fn routine_declaration_mode(routine: &RoutineDeclarationSyntax) -> DeclarationMo
     } else {
         DeclarationMode::Fresh
     }
-}
-
-fn system_operator_contract(canonical_name: &str) -> Option<BuiltinContract> {
-    let operator = match canonical_name {
-        "&op_checkedaddition" | "&op_addition" => Operator::Add,
-        "&op_checkedsubtraction" | "&op_subtraction" => Operator::Subtract,
-        "&op_checkedmultiply" | "&op_multiply" => Operator::Multiply,
-        "&op_checkedintdivide" | "&op_intdivide" => Operator::IntegerDivide,
-        "&op_division" => Operator::RealDivide,
-        "&op_modulus" => Operator::Modulo,
-        "&op_leftshift" => Operator::ShiftLeft,
-        "&op_rightshift" => Operator::ShiftRight,
-        "&op_checkedunarynegation" | "&op_unarynegation" => Operator::Negative,
-        "&op_unaryplus" => Operator::Positive,
-        "&op_logicalnot" => Operator::Not,
-        "&op_equality" => Operator::Equal,
-        "&op_inequality" => Operator::NotEqual,
-        "&op_greaterthan" => Operator::Greater,
-        "&op_greaterthanorequal" => Operator::GreaterEqual,
-        "&op_lessthan" => Operator::Less,
-        "&op_lessthanorequal" => Operator::LessEqual,
-        "&op_logicaland" | "&op_bitwiseand" => Operator::And,
-        "&op_logicalor" | "&op_bitwiseor" => Operator::Or,
-        "&op_logicalxor" | "&op_bitwisexor" => Operator::Xor,
-        "&op_in" => Operator::In,
-        // Implicit/explicit declarations are conversions, not assignment.
-        "&op_checkedimplicit" | "&op_implicit" | "&op_explicit" => return None,
-        _ => return None,
-    };
-    Some(BuiltinContract::Operator(operator))
 }
 
 fn semantic_calling_convention(syntax: CallingConventionSyntax) -> CallingConvention {

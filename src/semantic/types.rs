@@ -96,6 +96,7 @@ pub enum ValueConversionOperation {
     StringBorrow,
     ArrayConvert,
     Callable,
+    UntypedValue,
     UntypedStorage,
     CustomOperator {
         symbol: SymbolId,
@@ -1894,10 +1895,20 @@ pub enum ParameterMode {
     ConstRef,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormalTypeKind {
+    Declared,
+    /// The Pascal declaration deliberately omitted a formal type. `ty` is
+    /// only an internal placeholder; application binding must not compare an
+    /// actual type against it.
+    Omitted,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FormalParameter {
     pub mode: ParameterMode,
     pub ty: TypeRef,
+    pub type_kind: FormalTypeKind,
     pub default: Option<ConstantValue>,
 }
 
@@ -2768,6 +2779,7 @@ mod tests {
                     parameters: vec![FormalParameter {
                         mode: ParameterMode::Value,
                         ty: parameter,
+                        type_kind: FormalTypeKind::Declared,
                         default: None,
                     }],
                     result: None,

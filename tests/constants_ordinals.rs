@@ -256,7 +256,7 @@ fn parameterized_builtin_contracts_share_constant_and_runtime_binding() {
         .primary[0]
         .symbol;
     let SymbolKind::Routine(_) = compilation.binder.scopes.symbol(high_symbol).kind else {
-        panic!("System.High must remain the ordinary routine declared by rtl/system.pp")
+        panic!("System.High must retain the routine-category symbol declared by rtl/system.pp")
     };
     let high_family = compilation
         .builtin_families

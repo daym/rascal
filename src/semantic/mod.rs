@@ -22,7 +22,8 @@ pub use binder::{
 pub use builtins::{
     BuiltinActual, BuiltinContract, BuiltinFamilyDecl, BuiltinInstance, BuiltinInstantiation,
     BuiltinOperandForm, BuiltinOperation, BuiltinRegistry, BuiltinRejection, BuiltinTypeContext,
-    MetadataQuery, NumericOperation, OrdinalOperation, StepOperation,
+    MetadataQuery, NumericOperation, OrdinalOperation, SetMutationOperation, StepOperation,
+    builtin_contract_for_external_selector,
 };
 pub use constants::{
     ConstantEntry, ConstantEvaluationError, ConstantEvaluator, ConstantRegistry, ConstantValue,
@@ -56,9 +57,9 @@ pub use types::{
     AccessKind, AggregateShape, AliasType, ArrayType, CallableFlavor, CallableType,
     CallingConvention, Capture, ClassType, ConversionRank, EnumMember, EnumType,
     EnvironmentRequirement, ExplicitConversion, Field, FieldLayout, FormalParameter,
-    IncompleteReason, InterfaceType, MetaClassType, MethodDispatch, MethodMetadata, NilType,
-    ObjectType, OpaqueType, OrdinalDomain, PackedRecordType, ParameterMode, PascalType, Place,
-    PointerType, PrimitiveKind, PrimitiveType, ProcedurePointerTargetAbi, RangeCheck,
+    FormalTypeKind, IncompleteReason, InterfaceType, MetaClassType, MethodDispatch, MethodMetadata,
+    NilType, ObjectType, OpaqueType, OrdinalDomain, PackedRecordType, ParameterMode, PascalType,
+    Place, PointerType, PrimitiveKind, PrimitiveType, ProcedurePointerTargetAbi, RangeCheck,
     RawMethodType, RegularRecordType, RoutineOwner, RoutineSignature, SetType, StorageBase,
     StorageLayout, StringKind, StringLiteralType, StringType, SubrangeType, TypeEntry, TypeOwner,
     TypeQuery, TypeRegistry, TypeRegistryError, TypeState, UnitType, UntypedPointerType,

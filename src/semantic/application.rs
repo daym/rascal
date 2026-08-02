@@ -540,8 +540,12 @@ fn conversion_rank_priority(conversion: &ConversionResolution) -> Option<u8> {
         }
         ResolvedConversion::Explicit(
             super::ExplicitConversion::IntegerTruncate { .. }
+            | super::ExplicitConversion::RealNarrow { .. }
+            | super::ExplicitConversion::OrdinalCast { .. }
             | super::ExplicitConversion::PointerCrossing { .. }
             | super::ExplicitConversion::RelatedDowncast { .. }
+            | super::ExplicitConversion::ProcedureAdapter { .. }
+            | super::ExplicitConversion::ProcedurePointerCrossing { .. }
             | super::ExplicitConversion::RepresentationOverlay { .. }
             | super::ExplicitConversion::CustomOperator { .. },
         ) => Some(0),

@@ -100,10 +100,30 @@ impl SymbolKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PropertyAccessor {
+    pub name: NameId,
+    pub symbols: Vec<SymbolId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PropertySymbol {
     pub ty: TypeRef,
-    pub readable: bool,
-    pub writable: bool,
+    pub parameters: Vec<super::FormalParameter>,
+    pub read: Option<PropertyAccessor>,
+    pub write: Option<PropertyAccessor>,
+    pub read_contract: Option<TypeRef>,
+    pub write_contract: Option<TypeRef>,
+    pub is_default: bool,
+}
+
+impl PropertySymbol {
+    pub const fn readable(&self) -> bool {
+        self.read.is_some()
+    }
+
+    pub const fn writable(&self) -> bool {
+        self.write.is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

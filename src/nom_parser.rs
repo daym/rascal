@@ -235,6 +235,7 @@ fn parse_postfix(input: Input<'_>) -> NomResult<'_, Expr> {
                         base: Box::new(expression),
                         indices,
                         range_checks: close.modes.range_checks,
+                        modes: close.modes,
                     },
                     start..close.span.end,
                 );

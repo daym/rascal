@@ -3,10 +3,10 @@ use std::collections::BTreeMap;
 use super::{
     AggregateShape, CallableFlavor, CallableType, ConstantRegistry, DeclId, DeclarationMode,
     DeclarationState, DeclareError, EnvironmentCheckpoint, EnvironmentId, EnvironmentRequirement,
-    Field, FieldLayout, FrameKind, IncompleteReason, LookupEdge, LookupRequest, NameId, ObjectType,
-    PackedRecordType, PascalType, PointerType, RegionOwner, RegularRecordType, RoutineOwner,
-    RoutineSignature, ScopeGraph, StorageLayout, SymbolId, SymbolKind, TypeOwner, TypeRef,
-    TypeRegistry, TypeRegistryError, TypeSectionId, VariantPart,
+    Field, FieldLayout, FrameKind, IncompleteReason, InterfaceType, LookupEdge, LookupRequest,
+    NameId, ObjectType, PackedRecordType, PascalType, PointerType, RegionOwner, RegularRecordType,
+    RoutineOwner, RoutineSignature, ScopeGraph, StorageLayout, SymbolId, SymbolKind, TypeOwner,
+    TypeRef, TypeRegistry, TypeRegistryError, TypeSectionId, VariantPart,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +44,7 @@ pub enum AggregateKind {
     PackedRecord,
     Object { base: Option<TypeRef> },
     Class { base: Option<TypeRef> },
+    Interface { base: Option<TypeRef> },
 }
 
 #[derive(Clone, Debug)]
@@ -53,6 +54,7 @@ pub struct AggregateDefinition {
     pub layout: StorageLayout,
     pub fields: Vec<Field>,
     pub methods: Vec<TypeRef>,
+    pub default_property: Option<SymbolId>,
     member_region: super::RegionId,
     inherited_environment: Option<EnvironmentId>,
     selected_environment: EnvironmentCheckpoint,
@@ -333,7 +335,8 @@ impl SemanticBinder {
         let mut fallbacks = Vec::new();
         let mut inherited_environment = None;
         if let AggregateKind::Object { base: Some(base) }
-        | AggregateKind::Class { base: Some(base) } = kind
+        | AggregateKind::Class { base: Some(base) }
+        | AggregateKind::Interface { base: Some(base) } = kind
         {
             let inherited = self
                 .types
@@ -353,6 +356,7 @@ impl SemanticBinder {
             layout,
             fields: Vec::new(),
             methods: Vec::new(),
+            default_property: None,
             member_region,
             inherited_environment,
             selected_environment,
@@ -400,7 +404,9 @@ impl SemanticBinder {
     ) -> Result<DeclaredType, BindError> {
         if matches!(
             aggregate.kind,
-            AggregateKind::Object { .. } | AggregateKind::Class { .. }
+            AggregateKind::Object { .. }
+                | AggregateKind::Class { .. }
+                | AggregateKind::Interface { .. }
         ) && variant.is_some()
         {
             self.types.mark_error(aggregate.declared.ty);
@@ -427,6 +433,7 @@ impl SemanticBinder {
         let shape = AggregateShape {
             member_environment,
             fields: aggregate.fields,
+            default_property: aggregate.default_property,
         };
         let implementation = match aggregate.kind {
             AggregateKind::RegularRecord => AggregateImplementation::Regular(RegularRecordType {
@@ -452,6 +459,13 @@ impl SemanticBinder {
                 methods: aggregate.methods,
                 pointer_layout: aggregate.layout,
             }),
+            AggregateKind::Interface { base } => {
+                AggregateImplementation::Interface(InterfaceType {
+                    aggregate: Some(shape),
+                    bases: base.into_iter().collect(),
+                    pointer_layout: aggregate.layout,
+                })
+            }
         };
         let result = implementation.complete(&mut self.types, aggregate.declared.ty);
         self.scopes
@@ -624,6 +638,7 @@ enum AggregateImplementation {
     Packed(PackedRecordType),
     Object(ObjectType),
     Class(super::ClassType),
+    Interface(InterfaceType),
 }
 
 impl AggregateImplementation {
@@ -633,6 +648,7 @@ impl AggregateImplementation {
             Self::Packed(implementation) => types.complete(ty, implementation),
             Self::Object(implementation) => types.complete(ty, implementation),
             Self::Class(implementation) => types.complete(ty, implementation),
+            Self::Interface(implementation) => types.complete(ty, implementation),
         }
     }
 }

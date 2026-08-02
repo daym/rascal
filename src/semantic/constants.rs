@@ -212,6 +212,7 @@ impl<'a> ConstantEvaluator<'a> {
                 })
             }
             BoundExpressionKind::Member { .. }
+            | BoundExpressionKind::Property { .. }
             | BoundExpressionKind::Index { .. }
             | BoundExpressionKind::Dereference(_)
             | BoundExpressionKind::Error => Err(ConstantEvaluationError::NotConstant),
@@ -415,8 +416,12 @@ fn conversion_uses_custom_operator(conversion: &super::ConversionResolution) -> 
         ),
         Some(ResolvedConversion::Explicit(
             ExplicitConversion::IntegerTruncate { .. }
+            | ExplicitConversion::RealNarrow { .. }
+            | ExplicitConversion::OrdinalCast { .. }
             | ExplicitConversion::PointerCrossing { .. }
             | ExplicitConversion::RelatedDowncast { .. }
+            | ExplicitConversion::ProcedureAdapter { .. }
+            | ExplicitConversion::ProcedurePointerCrossing { .. }
             | ExplicitConversion::RepresentationOverlay { .. },
         ))
         | None => false,

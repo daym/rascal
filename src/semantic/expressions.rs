@@ -174,6 +174,19 @@ pub struct BoundExpression {
     pub span: Span,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PropertyAccessKind {
+    Read,
+    Write,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundPropertyBinding {
+    pub kind: PropertyAccessKind,
+    pub resolution: ApplicationResolution,
+    pub accessor_symbols: Vec<SymbolId>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoundExpressionKind {
     Symbol {
@@ -190,6 +203,13 @@ pub enum BoundExpressionKind {
     Member {
         base: Box<BoundExpression>,
         symbol: SymbolId,
+    },
+    Property {
+        base: Option<Box<BoundExpression>>,
+        lookup_receiver: Option<ReceiverId>,
+        symbol: SymbolId,
+        indices: Vec<BoundExpression>,
+        binding: Option<Box<BoundPropertyBinding>>,
     },
     Index {
         base: Box<BoundExpression>,

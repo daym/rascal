@@ -171,6 +171,7 @@ pub enum ExprKind {
         base: Box<Expr>,
         indices: Vec<Expr>,
         range_checks: bool,
+        modes: ModeSnapshot,
     },
     Dereference(Box<Expr>),
     Set(Vec<SetElement>),

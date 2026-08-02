@@ -132,9 +132,14 @@ pub struct ValueDeclarationSyntax {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PropertyDeclarationSyntax {
-    pub value: ValueDeclarationSyntax,
-    pub readable: bool,
-    pub writable: bool,
+    pub name: SpannedName,
+    pub parameters: Vec<FormalParameterSyntax>,
+    pub ty: Option<TypeSyntax>,
+    pub read: Option<SpannedName>,
+    pub write: Option<SpannedName>,
+    pub is_default: bool,
+    pub span: Span,
+    pub modes: ModeSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,7 +193,7 @@ impl DeclarationSyntax {
             | Self::Labels { span, .. }
             | Self::Unsupported { span, .. } => span.clone(),
             Self::Variables(declaration) | Self::Constants(declaration) => declaration.span.clone(),
-            Self::Property(declaration) => declaration.value.span.clone(),
+            Self::Property(declaration) => declaration.span.clone(),
             Self::Routine(declaration) => declaration.span.clone(),
             Self::Visibility { name } => name.span.clone(),
         }

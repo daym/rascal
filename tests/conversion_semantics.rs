@@ -1,7 +1,8 @@
 use rascal::semantic::{
     ArgumentConversion, BoundApplicationTarget, BoundExpressionKind, BoundStatementKind,
     ConversionCandidate, ConversionRejection, ConversionSelection, ExplicitConversion,
-    ExpressionCategory, ResolvedConversion, SemanticUse, ValueConversionOperation, bind_sources,
+    ExpressionCategory, PropertyAccessKind, ResolvedConversion, SemanticUse,
+    ValueConversionOperation, bind_sources,
 };
 
 fn program_body(
@@ -360,4 +361,167 @@ fn property_read_and_write_capabilities_control_semantic_use() {
         "{:#?}",
         compilation.diagnostics
     );
+}
+
+#[test]
+fn indexed_and_default_properties_bind_accessor_contracts() {
+    let source = "
+        program PropertyContracts;
+        type
+          TBox = class
+            function GetItem(Index: LongInt): LongInt;
+            procedure SetItem(Index: LongInt; Value: LongInt);
+            property Items[Index: LongInt]: LongInt read GetItem write SetItem; default;
+          end;
+        var Box: TBox;
+        var Value: LongInt;
+        begin
+          Value := Box[1];
+          Box.Items[2] := 3;
+        end.
+    ";
+    let compilation = bind_sources(&[("property_contracts.pp", source)]);
+    assert!(
+        compilation.diagnostics.is_empty(),
+        "{:#?}",
+        compilation.diagnostics
+    );
+    let body = program_body(&compilation);
+    let BoundStatementKind::Assignment(read) = &body.statements[0].kind else {
+        panic!("expected property read assignment")
+    };
+    let BoundExpressionKind::Property {
+        binding: Some(binding),
+        indices,
+        ..
+    } = &read.source.kind
+    else {
+        panic!("expected bound default property read")
+    };
+    assert_eq!(indices.len(), 1);
+    assert_eq!(binding.kind, PropertyAccessKind::Read);
+    assert!(binding.resolution.selected_attempt().is_some());
+    assert_eq!(binding.accessor_symbols.len(), 1);
+
+    let BoundStatementKind::Assignment(write) = &body.statements[1].kind else {
+        panic!("expected property write assignment")
+    };
+    let BoundExpressionKind::Property {
+        binding: Some(binding),
+        indices,
+        ..
+    } = &write.target.kind
+    else {
+        panic!("expected bound indexed property write")
+    };
+    assert_eq!(indices.len(), 1);
+    assert_eq!(binding.kind, PropertyAccessKind::Write);
+    assert_eq!(
+        binding
+            .resolution
+            .selected_attempt()
+            .unwrap()
+            .arguments
+            .len(),
+        2
+    );
+    assert_eq!(binding.accessor_symbols.len(), 1);
+}
+
+#[test]
+fn bare_zero_argument_routines_call_only_in_application_contexts() {
+    let source = "
+        program AutoCalls;
+        function Answer: LongInt;
+        begin
+          Answer := 42;
+        end;
+        procedure Touch;
+        begin
+        end;
+        type TCallback = function: LongInt;
+        procedure Accept(Callback: TCallback);
+        begin
+        end;
+        var Value: LongInt;
+        var Callback: TCallback;
+        var Initialized: TCallback := Answer;
+        begin
+          Value := Answer;
+          Touch;
+          Callback := Answer;
+          Accept(Answer);
+        end.
+    ";
+    let compilation = bind_sources(&[("auto_calls.pp", source)]);
+    assert!(
+        compilation.diagnostics.is_empty(),
+        "{:#?}",
+        compilation.diagnostics
+    );
+    let body = program_body(&compilation);
+    let BoundStatementKind::Assignment(value) = &body.statements[0].kind else {
+        panic!("expected value assignment")
+    };
+    assert!(matches!(
+        value.source.kind,
+        BoundExpressionKind::Application { .. }
+    ));
+    let BoundStatementKind::Expression(touch) = &body.statements[1].kind else {
+        panic!("expected procedure statement")
+    };
+    assert!(matches!(
+        touch.kind,
+        BoundExpressionKind::Application { .. }
+    ));
+    let BoundStatementKind::Assignment(callback) = &body.statements[2].kind else {
+        panic!("expected procedure-value assignment")
+    };
+    assert!(matches!(
+        callback.source.kind,
+        BoundExpressionKind::Symbol { .. }
+    ));
+    let BoundStatementKind::Expression(accept) = &body.statements[3].kind else {
+        panic!("expected procedure-designator argument")
+    };
+    let BoundExpressionKind::Application { operands, .. } = &accept.kind else {
+        panic!("expected Accept application")
+    };
+    assert!(matches!(
+        operands[0].kind,
+        BoundExpressionKind::Symbol { .. }
+    ));
+}
+
+#[test]
+fn string_literals_and_long_strings_follow_the_pchar_matrix() {
+    let source = "
+        program StringPointers;
+        type PChar = ^Char;
+        var PointerValue: PChar;
+        var LongValue: AnsiString;
+        begin
+          PointerValue := 'abc';
+          PointerValue := PChar(LongValue);
+        end.
+    ";
+    let compilation = bind_sources(&[("string_pointers.pp", source)]);
+    assert!(
+        compilation.diagnostics.is_empty(),
+        "{:#?}",
+        compilation.diagnostics
+    );
+    let body = program_body(&compilation);
+    for statement in &body.statements {
+        let BoundStatementKind::Assignment(assignment) = &statement.kind else {
+            panic!("expected pointer assignment")
+        };
+        assert!(
+            assignment
+                .conversion
+                .as_ref()
+                .and_then(|conversion| conversion.selected())
+                .is_some()
+        );
+    }
 }

@@ -24,7 +24,7 @@ enum Suffix {
     },
     Index {
         indices: Vec<Expr>,
-        range_checks: bool,
+        modes: ModeSnapshot,
         end: usize,
     },
     Dereference {
@@ -94,13 +94,14 @@ fn apply_suffix(base: Expr, suffix: Suffix) -> Expr {
         ),
         Suffix::Index {
             indices,
-            range_checks,
+            modes,
             end,
         } => Expr::new(
             ExprKind::Index {
                 base: Box::new(base),
                 indices,
-                range_checks,
+                range_checks: modes.range_checks,
+                modes,
             },
             start..end,
         ),
@@ -311,7 +312,7 @@ pub fn expression_parser<'a>() -> impl Parser<'a, &'a [Token], Expr, Extra<'a>> 
                 .then(symbol(TokenKind::RightBracket))
                 .map(|(indices, close)| Suffix::Index {
                     indices,
-                    range_checks: close.modes.range_checks,
+                    modes: close.modes,
                     end: close.span.end,
                 });
 

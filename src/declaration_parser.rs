@@ -876,6 +876,56 @@ fn parse_formal_parameter(tokens: &[Token]) -> Option<FormalParameterSyntax> {
     })
 }
 
+fn matching_delimiter(
+    tokens: &[Token],
+    open: usize,
+    left: TokenKind,
+    right: TokenKind,
+) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(open) {
+        if token.kind == left {
+            depth += 1;
+        } else if token.kind == right {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn parse_formal_parameter_list(tokens: &[Token]) -> Vec<FormalParameterSyntax> {
+    let mut parameters = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    for index in 0..=tokens.len() {
+        let separator = match tokens.get(index).map(|token| &token.kind) {
+            Some(TokenKind::LeftParen | TokenKind::LeftBracket) => {
+                depth += 1;
+                false
+            }
+            Some(TokenKind::RightParen | TokenKind::RightBracket) => {
+                depth = depth.saturating_sub(1);
+                false
+            }
+            Some(TokenKind::Semicolon) => depth == 0,
+            None => true,
+            _ => false,
+        };
+        if separator {
+            if start < index
+                && let Some(parameter) = parse_formal_parameter(&tokens[start..index])
+            {
+                parameters.push(parameter);
+            }
+            start = index + 1;
+        }
+    }
+    parameters
+}
+
 fn routine_signature_syntax(tokens: &[Token]) -> (Vec<FormalParameterSyntax>, Option<TypeSyntax>) {
     let header_end = first_semicolon(tokens, 0).min(tokens.len());
     let open = tokens[..header_end]
@@ -1238,28 +1288,110 @@ impl<'a> DeclarationScanner<'a> {
 
     fn parse_property(&mut self) -> DeclarationSyntax {
         let start = self.index;
-        let end = declaration_semicolon(self.tokens, start);
-        let end_exclusive = (end + 1).min(self.tokens.len());
-        let value = parse_value_declaration(&self.tokens[start + 1..end_exclusive], false)
-            .unwrap_or_else(|| ValueDeclarationSyntax {
-                names: Vec::new(),
-                ty: None,
-                initializer: None,
-                span: token_span(
-                    &self.tokens[start..end_exclusive],
-                    self.tokens[start].span.start,
-                ),
-                modes: self.tokens[start].modes,
+        let declaration_end = declaration_semicolon(self.tokens, start);
+        let header_end = declaration_end.min(self.tokens.len());
+        let header = &self.tokens[start + 1..header_end];
+        let name = header
+            .first()
+            .and_then(|token| match &token.kind {
+                TokenKind::Identifier(spelling) => Some(SpannedName {
+                    spelling: spelling.clone(),
+                    span: token.span.clone(),
+                }),
+                _ => None,
+            })
+            .unwrap_or_else(|| SpannedName {
+                spelling: "<missing>".to_owned(),
+                span: self.tokens[start].span.clone(),
             });
+
+        let bracket_open = header
+            .iter()
+            .position(|token| token.kind == TokenKind::LeftBracket);
+        let bracket_close = bracket_open.and_then(|open| {
+            matching_delimiter(
+                header,
+                open,
+                TokenKind::LeftBracket,
+                TokenKind::RightBracket,
+            )
+        });
+        let parameters = bracket_open
+            .zip(bracket_close)
+            .map_or_else(Vec::new, |(open, close)| {
+                parse_formal_parameter_list(&header[open + 1..close])
+            });
+
+        let type_start = bracket_close.map_or(1, |close| close + 1);
+        let colon = header
+            .iter()
+            .enumerate()
+            .skip(type_start)
+            .find_map(|(index, token)| (token.kind == TokenKind::Colon).then_some(index));
+        let type_end = colon.map(|colon| {
+            header
+                .iter()
+                .enumerate()
+                .skip(colon + 1)
+                .find_map(|(index, token)| {
+                    [
+                        "read",
+                        "write",
+                        "stored",
+                        "default",
+                        "nodefault",
+                        "implements",
+                    ]
+                    .iter()
+                    .any(|word| is_keyword(token, word))
+                    .then_some(index)
+                })
+                .unwrap_or(header.len())
+        });
+        let ty = colon.zip(type_end).and_then(|(colon, end)| {
+            (colon + 1 < end).then(|| parse_type_syntax(&header[colon + 1..end]))
+        });
+
+        let accessor = |keyword: &str| {
+            header
+                .iter()
+                .position(|token| is_keyword(token, keyword))
+                .and_then(|index| header.get(index + 1))
+                .and_then(|token| match &token.kind {
+                    TokenKind::Identifier(spelling) => Some(SpannedName {
+                        spelling: spelling.clone(),
+                        span: token.span.clone(),
+                    }),
+                    _ => None,
+                })
+        };
+        let read = accessor("read");
+        let write = accessor("write");
+
+        let mut end_exclusive = (declaration_end + 1).min(self.tokens.len());
+        let mut is_default = header.iter().any(|token| is_keyword(token, "default"));
+        if end_exclusive < self.tokens.len()
+            && (is_keyword(&self.tokens[end_exclusive], "default")
+                || is_keyword(&self.tokens[end_exclusive], "nodefault"))
+        {
+            is_default = is_keyword(&self.tokens[end_exclusive], "default");
+            end_exclusive =
+                (declaration_semicolon(self.tokens, end_exclusive) + 1).min(self.tokens.len());
+        }
+        let span = token_span(
+            &self.tokens[start..end_exclusive],
+            self.tokens[start].span.start,
+        );
         self.index = end_exclusive;
         DeclarationSyntax::Property(PropertyDeclarationSyntax {
-            value,
-            readable: self.tokens[start..end_exclusive]
-                .iter()
-                .any(|token| is_keyword(token, "read")),
-            writable: self.tokens[start..end_exclusive]
-                .iter()
-                .any(|token| is_keyword(token, "write")),
+            name,
+            parameters,
+            ty,
+            read,
+            write,
+            is_default,
+            span,
+            modes: self.tokens[start].modes,
         })
     }
 

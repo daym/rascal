@@ -19,18 +19,19 @@ use super::{
     ActualArgument, AggregateDefinition, AggregateKind, AliasType, ApplicationCandidate,
     ApplicationReceiver, ApplicationResolution, ApplicationResolver, ApplicationSelection,
     ArrayType, BindError, BoundApplicationTarget, BoundAssignment, BoundBody, BoundCaseArm,
-    BoundCaseLabel, BoundExceptionHandler, BoundExpression, BoundExpressionKind, BoundSetElement,
-    BoundStatement, BoundStatementKind, BoundTryContinuation, CallableFlavor, CallableType,
-    CallingConvention, Capture, ConstantEntry, ConstantEvaluator, ConstantValue,
-    ConversionResolution, ConversionResolver, ConversionSelection, DeclarationMode,
-    DeclarationState, DeclaredRoutine, EnumMember, EnumType, EnvironmentId, EnvironmentRequirement,
-    ExpressionCategory, FieldLayout, FormalParameter, FrameKind, IncompleteReason, LookupBarrier,
-    LookupEdge, LookupRequest, LookupResult, ModuleGraphError, ModuleId, ModulePhase,
-    ModuleRegistry, NameId, NodeId, OpaqueType, OrdinalDomain, ParameterMode, PointerType,
-    PrimitiveKind, PrimitiveType, PropertySymbol, ReceiverId, RegionOwner, RoutineOwner,
-    RoutineSignature, SemanticBinder, SemanticUse, SetType, StorageLayout, SubrangeType,
-    SymbolCategory, SymbolFilter, SymbolId, SymbolKind, TypeOwner, TypeRef, UnitType,
-    VariantAlternative, VariantPart,
+    BoundCaseLabel, BoundExceptionHandler, BoundExpression, BoundExpressionKind,
+    BoundPropertyBinding, BoundSetElement, BoundStatement, BoundStatementKind,
+    BoundTryContinuation, CallableFlavor, CallableType, CallingConvention, Capture, ConstantEntry,
+    ConstantEvaluator, ConstantValue, ConversionResolution, ConversionResolver,
+    ConversionSelection, DeclarationMode, DeclarationState, DeclaredRoutine, EnumMember, EnumType,
+    EnvironmentId, EnvironmentRequirement, ExpressionCategory, FieldLayout, FormalParameter,
+    FrameKind, IncompleteReason, LookupBarrier, LookupEdge, LookupRequest, LookupResult,
+    ModuleGraphError, ModuleId, ModulePhase, ModuleRegistry, NameId, NilType, NodeId, OpaqueType,
+    OrdinalDomain, ParameterMode, PointerType, PrimitiveKind, PrimitiveType, PropertyAccessKind,
+    PropertyAccessor, PropertySymbol, RawMethodType, ReceiverId, RegionOwner, RoutineOwner,
+    RoutineSignature, SemanticBinder, SemanticUse, SetType, StorageLayout, StringKind,
+    StringLiteralType, StringType, SubrangeType, SymbolCategory, SymbolFilter, SymbolId,
+    SymbolKind, TypeOwner, TypeRef, UnitType, UntypedPointerType, VariantAlternative, VariantPart,
 };
 
 #[derive(Clone, Debug)]
@@ -55,9 +56,10 @@ pub struct SemanticCompilation {
 #[derive(Clone, Copy, Debug)]
 struct BuiltinTypes {
     integer: TypeRef,
+    real: TypeRef,
     boolean: TypeRef,
     character: TypeRef,
-    string: TypeRef,
+    nil: TypeRef,
     untyped_parameter: TypeRef,
 }
 
@@ -338,7 +340,9 @@ impl CompilationDriver {
                     }
                 }
                 DeclarationSyntax::Constants(value) => self.bind_values(value, true),
-                DeclarationSyntax::Property(value) => self.bind_properties(value),
+                DeclarationSyntax::Property(value) => {
+                    self.bind_properties(value, aggregate.as_deref_mut())
+                }
                 DeclarationSyntax::Labels { names, span } => {
                     for name in names {
                         let name_id = self.binder.scopes.intern_name(&name.spelling);
@@ -761,9 +765,8 @@ impl CompilationDriver {
             AggregateSyntaxKind::Record => AggregateKind::RegularRecord,
             AggregateSyntaxKind::PackedRecord => AggregateKind::PackedRecord,
             AggregateSyntaxKind::Object => AggregateKind::Object { base },
-            AggregateSyntaxKind::Class | AggregateSyntaxKind::Interface => {
-                AggregateKind::Class { base }
-            }
+            AggregateSyntaxKind::Class => AggregateKind::Class { base },
+            AggregateSyntaxKind::Interface => AggregateKind::Interface { base },
         };
         let layout = if matches!(
             syntax_kind,
@@ -916,14 +919,16 @@ impl CompilationDriver {
                 AggregateKind::RegularRecord | AggregateKind::Object { .. } => {
                     align_up(aggregate.layout.size, storage.alignment)
                 }
-                AggregateKind::Class { .. } => aggregate.fields.last().map_or(0, |field| {
-                    field.layout.byte_offset
-                        + self
-                            .binder
-                            .types
-                            .storage_layout(field.ty)
-                            .map_or(0, |layout| layout.size)
-                }),
+                AggregateKind::Class { .. } | AggregateKind::Interface { .. } => {
+                    aggregate.fields.last().map_or(0, |field| {
+                        field.layout.byte_offset
+                            + self
+                                .binder
+                                .types
+                                .storage_layout(field.ty)
+                                .map_or(0, |layout| layout.size)
+                    })
+                }
             };
             let field_layout = FieldLayout {
                 byte_offset,
@@ -936,7 +941,10 @@ impl CompilationDriver {
                 .declare_field(aggregate, name_id, ty, field_layout)
             {
                 self.bind_error(name.span.clone(), error);
-            } else if !matches!(aggregate.kind, AggregateKind::Class { .. }) {
+            } else if !matches!(
+                aggregate.kind,
+                AggregateKind::Class { .. } | AggregateKind::Interface { .. }
+            ) {
                 aggregate.layout.size = byte_offset.saturating_add(storage.size);
                 if !matches!(aggregate.kind, AggregateKind::PackedRecord) {
                     aggregate.layout.alignment = aggregate.layout.alignment.max(storage.alignment);
@@ -950,10 +958,9 @@ impl CompilationDriver {
             .ty
             .as_ref()
             .and_then(|syntax| self.resolve_type(syntax));
-        let mut initializer = declaration
-            .initializer
-            .as_ref()
-            .map(|initializer| self.bind_expression(initializer, None));
+        let mut initializer = declaration.initializer.as_ref().map(|initializer| {
+            self.bind_expression_with_expected(initializer, None, explicit_type)
+        });
         let constant_conversion_valid = if constant
             && let (Some(destination), Some(initializer)) = (explicit_type, initializer.as_mut())
         {
@@ -1109,33 +1116,135 @@ impl CompilationDriver {
         }
     }
 
-    fn bind_properties(&mut self, declaration: &PropertyDeclarationSyntax) {
+    fn bind_properties(
+        &mut self,
+        declaration: &PropertyDeclarationSyntax,
+        mut aggregate: Option<&mut AggregateDefinition>,
+    ) {
         let Some(ty) = declaration
-            .value
             .ty
             .as_ref()
             .and_then(|syntax| self.resolve_type(syntax))
         else {
             self.diagnostics.push(Diagnostic::new(
-                declaration.value.span.clone(),
+                declaration.span.clone(),
                 "property type could not be resolved",
             ));
             return;
         };
-        for name in &declaration.value.names {
-            let name_id = self.binder.scopes.intern_name(&name.spelling);
-            if let Err(error) = self.binder.scopes.declare(
-                name_id,
-                SymbolKind::Property(PropertySymbol {
-                    ty,
-                    readable: declaration.readable,
-                    writable: declaration.writable,
+        let parameters = self
+            .resolve_procedural_signature(
+                &declaration.parameters,
+                None,
+                CallingConventionSyntax::Pascal,
+            )
+            .parameters;
+        if parameters
+            .iter()
+            .any(|parameter| matches!(parameter.mode, ParameterMode::Var | ParameterMode::Out))
+        {
+            self.diagnostics.push(Diagnostic::new(
+                declaration.span.clone(),
+                "property index parameters cannot be var or out",
+            ));
+        }
+        let read = declaration
+            .read
+            .as_ref()
+            .map(|name| self.bind_property_accessor(name));
+        let write = declaration
+            .write
+            .as_ref()
+            .map(|name| self.bind_property_accessor(name));
+        let contract = |result, parameters: Vec<FormalParameter>| CallableType {
+            owner: aggregate
+                .as_ref()
+                .map_or(RoutineOwner::Module, |aggregate| {
+                    RoutineOwner::Type(aggregate.declared.ty)
                 }),
-                DeclarationState::Complete,
-                DeclarationMode::Fresh,
-            ) {
-                self.bind_error(name.span.clone(), error.into());
+            flavor: CallableFlavor::Routine,
+            signature: RoutineSignature {
+                parameters,
+                result,
+                calling_convention: CallingConvention::Pascal,
+            },
+            declaration_region: None,
+            nested_routines: Vec::new(),
+            local_types: Vec::new(),
+            captures: Vec::new(),
+            environment: EnvironmentRequirement::None,
+            has_body: false,
+        };
+        let read_contract = read
+            .as_ref()
+            .map(|_| self.allocate_anonymous(contract(Some(ty), parameters.clone())));
+        let write_contract = write.as_ref().map(|_| {
+            let mut write_parameters = parameters.clone();
+            write_parameters.push(FormalParameter {
+                mode: ParameterMode::Value,
+                ty,
+                default: None,
+            });
+            self.allocate_anonymous(contract(None, write_parameters))
+        });
+        let name_id = self.binder.scopes.intern_name(&declaration.name.spelling);
+        let symbol = match self.binder.scopes.declare(
+            name_id,
+            SymbolKind::Property(PropertySymbol {
+                ty,
+                parameters,
+                read,
+                write,
+                read_contract,
+                write_contract,
+                is_default: declaration.is_default,
+            }),
+            DeclarationState::Complete,
+            DeclarationMode::Fresh,
+        ) {
+            Ok(symbol) => symbol,
+            Err(error) => {
+                self.bind_error(declaration.name.span.clone(), error.into());
+                return;
             }
+        };
+        if declaration.is_default
+            && let Some(aggregate) = aggregate.as_mut()
+            && aggregate.default_property.replace(symbol).is_some()
+        {
+            self.diagnostics.push(Diagnostic::new(
+                declaration.span.clone(),
+                "aggregate has more than one default property",
+            ));
+        }
+    }
+
+    fn bind_property_accessor(&mut self, name: &SpannedName) -> PropertyAccessor {
+        let name_id = self.binder.scopes.intern_name(&name.spelling);
+        let symbols = self
+            .binder
+            .scopes
+            .lookup_symbol(
+                self.binder.scopes.current_environment(),
+                name_id,
+                LookupRequest::ORDINARY,
+            )
+            .map_or_else(Vec::new, |lookup| {
+                lookup
+                    .primary
+                    .into_iter()
+                    .filter_map(|hit| {
+                        matches!(
+                            self.binder.scopes.symbol(hit.symbol).kind,
+                            SymbolKind::Variable(_) | SymbolKind::Routine(_)
+                        )
+                        .then_some(hit.symbol)
+                    })
+                    .collect()
+            });
+        PropertyAccessor {
+            name: name_id,
+            symbols,
         }
     }
 
@@ -1428,7 +1537,9 @@ impl CompilationDriver {
         match statement {
             Statement::Expression(expression) => BoundStatement {
                 span: expression.span.clone(),
-                kind: BoundStatementKind::Expression(self.bind_expression(expression, owner)),
+                kind: BoundStatementKind::Expression(
+                    self.bind_statement_expression(expression, owner),
+                ),
             },
             Statement::Assignment(application) => BoundStatement {
                 span: application.span.clone(),
@@ -1777,12 +1888,12 @@ impl CompilationDriver {
                 }
             }
             Statement::Exit { value, modes, span } => {
-                let mut value = value
-                    .as_ref()
-                    .map(|value| self.bind_expression(value, owner));
                 let result = owner
                     .and_then(|owner| self.binder.types.callable(owner))
                     .and_then(|callable| callable.signature.result);
+                let mut value = value
+                    .as_ref()
+                    .map(|value| self.bind_expression_with_expected(value, owner, result));
                 match (result, value.as_mut()) {
                     (Some(destination), Some(value)) => {
                         self.apply_implicit_conversion(
@@ -1810,12 +1921,12 @@ impl CompilationDriver {
                 modes,
                 span,
             } => {
-                let mut initializer = initializer
-                    .as_ref()
-                    .map(|initializer| self.bind_expression(initializer, owner));
                 let explicit_type = type_name
                     .as_ref()
                     .and_then(|path| self.resolve_type_path_strings(path, span.clone()));
+                let mut initializer = initializer.as_ref().map(|initializer| {
+                    self.bind_expression_with_expected(initializer, owner, explicit_type)
+                });
                 let ty = explicit_type
                     .or_else(|| initializer.as_ref().and_then(|initializer| initializer.ty));
                 let Some(ty) = ty else {
@@ -2046,6 +2157,19 @@ impl CompilationDriver {
         self.bind_expression_for(expression, owner, SemanticUse::Value)
     }
 
+    fn bind_expression_with_expected(
+        &mut self,
+        expression: &Expr,
+        owner: Option<TypeRef>,
+        expected: Option<TypeRef>,
+    ) -> BoundExpression {
+        if expected.is_some_and(|expected| self.binder.types.callable(expected).is_some()) {
+            self.bind_expression_without_implicit_call(expression, owner, SemanticUse::Value)
+        } else {
+            self.bind_expression(expression, owner)
+        }
+    }
+
     fn bind_expression_for(
         &mut self,
         expression: &Expr,
@@ -2054,6 +2178,15 @@ impl CompilationDriver {
     ) -> BoundExpression {
         let mut bound = self.bind_expression_raw(expression, owner);
         bound.semantic_use = semantic_use;
+        bound = self.bind_property_use(bound, semantic_use, expression_modes(expression));
+        if matches!(semantic_use, SemanticUse::Value | SemanticUse::Condition) {
+            bound = self.bind_implicit_zero_argument_call(
+                bound,
+                owner,
+                expression_modes(expression),
+                false,
+            );
+        }
         if bound.category == ExpressionCategory::Error {
             return bound;
         }
@@ -2083,6 +2216,341 @@ impl CompilationDriver {
         bound
     }
 
+    fn bind_statement_expression(
+        &mut self,
+        expression: &Expr,
+        owner: Option<TypeRef>,
+    ) -> BoundExpression {
+        let bound = self.bind_expression_for(expression, owner, SemanticUse::Value);
+        self.bind_implicit_zero_argument_call(bound, owner, expression_modes(expression), true)
+    }
+
+    fn bind_expression_without_implicit_call(
+        &mut self,
+        expression: &Expr,
+        owner: Option<TypeRef>,
+        semantic_use: SemanticUse,
+    ) -> BoundExpression {
+        let mut bound = self.bind_expression_raw(expression, owner);
+        bound.semantic_use = semantic_use;
+        self.bind_property_use(bound, semantic_use, expression_modes(expression))
+    }
+
+    fn bind_implicit_zero_argument_call(
+        &mut self,
+        expression: BoundExpression,
+        owner: Option<TypeRef>,
+        modes: crate::ModeSnapshot,
+        include_procedure: bool,
+    ) -> BoundExpression {
+        if matches!(expression.kind, BoundExpressionKind::Application { .. }) {
+            return expression;
+        }
+        let candidates = match &expression.kind {
+            BoundExpressionKind::Symbol { symbol, .. } => {
+                let symbol_info = self.binder.scopes.symbol(*symbol);
+                if !matches!(symbol_info.kind, SymbolKind::Routine(_)) {
+                    return expression;
+                }
+                self.binder
+                    .scopes
+                    .lookup_symbol(
+                        self.binder.scopes.current_environment(),
+                        symbol_info.name,
+                        LookupRequest::ORDINARY,
+                    )
+                    .map_or_else(Vec::new, |lookup| {
+                        callable_candidates(&lookup, &self.binder, owner)
+                    })
+            }
+            BoundExpressionKind::Member { base, symbol } => {
+                let symbol_info = self.binder.scopes.symbol(*symbol);
+                let Some(environment) = base
+                    .ty
+                    .and_then(|ty| self.binder.types.member_environment(ty))
+                else {
+                    return expression;
+                };
+                self.binder
+                    .scopes
+                    .lookup_symbol(environment, symbol_info.name, LookupRequest::ORDINARY)
+                    .map_or_else(Vec::new, |lookup| {
+                        lookup
+                            .primary
+                            .iter()
+                            .filter_map(|hit| {
+                                let SymbolKind::Routine(callable_type) =
+                                    self.binder.scopes.symbol(hit.symbol).kind
+                                else {
+                                    return None;
+                                };
+                                Some(ApplicationCandidate::Routine {
+                                    symbol: hit.symbol,
+                                    callable_type,
+                                    receiver: ApplicationReceiver::Explicit,
+                                })
+                            })
+                            .collect()
+                    })
+            }
+            _ => return expression,
+        };
+        let candidates = candidates
+            .into_iter()
+            .filter(|candidate| {
+                candidate
+                    .callable_type()
+                    .and_then(|ty| self.binder.types.callable(ty))
+                    .is_some_and(|callable| {
+                        (include_procedure || callable.signature.result.is_some())
+                            && callable
+                                .signature
+                                .parameters
+                                .iter()
+                                .all(|parameter| parameter.default.is_some())
+                    })
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return expression;
+        }
+        let resolution = self.resolve_application(candidates, &[], modes);
+        self.report_application_resolution(
+            &resolution,
+            expression.span.clone(),
+            "implicit zero-argument call",
+        );
+        let ty = resolution.result_type();
+        let span = expression.span.clone();
+        BoundExpression {
+            kind: BoundExpressionKind::Application {
+                target: BoundApplicationTarget::Routine { resolution },
+                callee: Some(Box::new(expression)),
+                operands: Vec::new(),
+                modes,
+            },
+            ty,
+            category: ExpressionCategory::Temporary,
+            semantic_use: SemanticUse::Value,
+            conversion: None,
+            span,
+        }
+    }
+
+    fn bind_property_use(
+        &mut self,
+        mut expression: BoundExpression,
+        semantic_use: SemanticUse,
+        modes: crate::ModeSnapshot,
+    ) -> BoundExpression {
+        let (symbol, lookup_receiver, explicit_receiver, indices) = match &expression.kind {
+            BoundExpressionKind::Property {
+                base,
+                symbol,
+                lookup_receiver,
+                indices,
+                ..
+            } => (*symbol, *lookup_receiver, base.is_some(), indices.clone()),
+            _ => return expression,
+        };
+        let SymbolKind::Property(property) = self.binder.scopes.symbol(symbol).kind.clone() else {
+            return expression;
+        };
+        if !matches!(semantic_use, SemanticUse::Value | SemanticUse::Condition) {
+            return expression;
+        }
+        let Some(callable_type) = property.read_contract else {
+            return expression;
+        };
+        let (candidates, accessor_symbols) = self.property_accessor_candidates(
+            symbol,
+            &property,
+            PropertyAccessKind::Read,
+            callable_type,
+            lookup_receiver,
+            explicit_receiver,
+        );
+        let resolution = self.resolve_application(candidates, &indices, modes);
+        self.report_application_resolution(&resolution, expression.span.clone(), "property read");
+        if let BoundExpressionKind::Property { binding, .. } = &mut expression.kind {
+            *binding = Some(Box::new(BoundPropertyBinding {
+                kind: PropertyAccessKind::Read,
+                resolution,
+                accessor_symbols,
+            }));
+        }
+        expression
+    }
+
+    fn bind_property_write(
+        &mut self,
+        target: &mut BoundExpression,
+        source: &mut BoundExpression,
+        modes: crate::ModeSnapshot,
+    ) -> Option<ConversionResolution> {
+        let (symbol, lookup_receiver, explicit_receiver, mut operands) = match &target.kind {
+            BoundExpressionKind::Property {
+                base,
+                symbol,
+                lookup_receiver,
+                indices,
+                ..
+            } => (*symbol, *lookup_receiver, base.is_some(), indices.clone()),
+            _ => return None,
+        };
+        let SymbolKind::Property(property) = self.binder.scopes.symbol(symbol).kind.clone() else {
+            return None;
+        };
+        let callable_type = property.write_contract?;
+        operands.push(source.clone());
+        let (candidates, accessor_symbols) = self.property_accessor_candidates(
+            symbol,
+            &property,
+            PropertyAccessKind::Write,
+            callable_type,
+            lookup_receiver,
+            explicit_receiver,
+        );
+        let resolution = self.resolve_application(candidates, &operands, modes);
+        self.report_application_resolution(&resolution, target.span.clone(), "property write");
+        let conversion = resolution
+            .selected_attempt()
+            .and_then(|attempt| attempt.arguments.last())
+            .and_then(|argument| match argument.conversion.as_ref()? {
+                super::ArgumentConversion::Implicit(conversion)
+                | super::ArgumentConversion::Explicit(conversion) => Some(conversion.clone()),
+                super::ArgumentConversion::Storage(_) => None,
+            });
+        source.conversion = conversion.clone();
+        if let BoundExpressionKind::Property { binding, .. } = &mut target.kind {
+            *binding = Some(Box::new(BoundPropertyBinding {
+                kind: PropertyAccessKind::Write,
+                resolution,
+                accessor_symbols,
+            }));
+        }
+        conversion
+    }
+
+    fn property_accessor_candidates(
+        &self,
+        property_symbol: SymbolId,
+        property: &PropertySymbol,
+        access: PropertyAccessKind,
+        fallback_contract: TypeRef,
+        lookup_receiver: Option<ReceiverId>,
+        explicit_receiver: bool,
+    ) -> (Vec<ApplicationCandidate>, Vec<SymbolId>) {
+        let accessor = match access {
+            PropertyAccessKind::Read => property.read.as_ref(),
+            PropertyAccessKind::Write => property.write.as_ref(),
+        };
+        let Some(accessor) = accessor else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut symbols = Vec::new();
+        let mut candidates = Vec::new();
+        let mut field_accessor = false;
+        for symbol in &accessor.symbols {
+            match self.binder.scopes.symbol(*symbol).kind {
+                SymbolKind::Routine(callable_type)
+                    if self.property_accessor_signature_matches(
+                        property,
+                        access,
+                        callable_type,
+                    ) =>
+                {
+                    let Some(callable) = self.binder.types.callable(callable_type) else {
+                        continue;
+                    };
+                    let receiver = match callable.flavor {
+                        CallableFlavor::Routine => ApplicationReceiver::None,
+                        CallableFlavor::Nested => ApplicationReceiver::StaticLink,
+                        CallableFlavor::Method if explicit_receiver => {
+                            ApplicationReceiver::Explicit
+                        }
+                        CallableFlavor::Method => lookup_receiver.map_or(
+                            ApplicationReceiver::ImplicitSelf,
+                            ApplicationReceiver::Lookup,
+                        ),
+                    };
+                    symbols.push(*symbol);
+                    candidates.push(ApplicationCandidate::Routine {
+                        symbol: *symbol,
+                        callable_type,
+                        receiver,
+                    });
+                }
+                SymbolKind::Variable(field_type)
+                    if property.parameters.is_empty()
+                        && self
+                            .binder
+                            .types
+                            .same_formal_contract(field_type, property.ty) =>
+                {
+                    symbols.push(*symbol);
+                    field_accessor = true;
+                }
+                _ => {}
+            }
+        }
+        if field_accessor || accessor.symbols.is_empty() {
+            candidates.push(ApplicationCandidate::CallableValue {
+                symbol: Some(property_symbol),
+                callable_type: fallback_contract,
+                receiver: ApplicationReceiver::CallableValue { lookup_receiver },
+            });
+        }
+        (candidates, symbols)
+    }
+
+    fn property_accessor_signature_matches(
+        &self,
+        property: &PropertySymbol,
+        access: PropertyAccessKind,
+        callable_type: TypeRef,
+    ) -> bool {
+        let Some(callable) = self.binder.types.callable(callable_type) else {
+            return false;
+        };
+        let expected_count =
+            property.parameters.len() + usize::from(access == PropertyAccessKind::Write);
+        if callable.signature.parameters.len() != expected_count {
+            return false;
+        }
+        let indexes_match = callable
+            .signature
+            .parameters
+            .iter()
+            .zip(&property.parameters)
+            .all(|(actual, declared)| {
+                actual.mode == declared.mode
+                    && self
+                        .binder
+                        .types
+                        .same_formal_contract(actual.ty, declared.ty)
+            });
+        if !indexes_match {
+            return false;
+        }
+        match access {
+            PropertyAccessKind::Read => callable
+                .signature
+                .result
+                .is_some_and(|result| self.binder.types.same_formal_contract(result, property.ty)),
+            PropertyAccessKind::Write => {
+                callable.signature.result.is_none()
+                    && callable.signature.parameters.last().is_some_and(|value| {
+                        value.mode == ParameterMode::Value
+                            && self
+                                .binder
+                                .types
+                                .same_formal_contract(value.ty, property.ty)
+                    })
+            }
+        }
+    }
+
     fn bind_expression_raw(
         &mut self,
         expression: &Expr,
@@ -2109,8 +2577,14 @@ impl CompilationDriver {
                     Literal::String(value) if value.chars().count() == 1 => {
                         Some(self.builtins.character)
                     }
-                    Literal::String(_) => Some(self.builtins.string),
-                    Literal::Real(_) | Literal::Nil => None,
+                    Literal::String(value) => Some(self.allocate_anonymous(StringLiteralType {
+                        element: self.builtins.character,
+                        index: self.builtins.integer,
+                        length: self.builtins.integer,
+                        character_count: u32::try_from(value.chars().count()).unwrap_or(u32::MAX),
+                    })),
+                    Literal::Real(_) => Some(self.builtins.real),
+                    Literal::Nil => Some(self.builtins.nil),
                 },
                 kind: BoundExpressionKind::Literal(literal.clone()),
                 category: ExpressionCategory::Value,
@@ -2147,9 +2621,19 @@ impl CompilationDriver {
                 let symbol_kind = self.binder.scopes.symbol(symbol).kind.clone();
                 let ty = symbol_kind.ty();
                 BoundExpression {
-                    kind: BoundExpressionKind::Member {
-                        base: Box::new(base),
-                        symbol,
+                    kind: if matches!(symbol_kind, SymbolKind::Property(_)) {
+                        BoundExpressionKind::Property {
+                            base: Some(Box::new(base)),
+                            lookup_receiver: None,
+                            symbol,
+                            indices: Vec::new(),
+                            binding: None,
+                        }
+                    } else {
+                        BoundExpressionKind::Member {
+                            base: Box::new(base),
+                            symbol,
+                        }
                     },
                     ty,
                     category: expression_category_for_symbol(&symbol_kind),
@@ -2159,18 +2643,60 @@ impl CompilationDriver {
                 }
             }
             ExprKind::Index { base, indices, .. } => {
-                let base = self.bind_expression(base, owner);
-                let indices = indices
+                let mut base = self.bind_expression_raw(base, owner);
+                let mut indices = indices
                     .iter()
                     .map(|index| self.bind_expression(index, owner))
-                    .collect();
+                    .collect::<Vec<_>>();
+                let indexed_property = match &base.kind {
+                    BoundExpressionKind::Property { symbol, .. } => {
+                        matches!(
+                            &self.binder.scopes.symbol(*symbol).kind,
+                            SymbolKind::Property(property) if !property.parameters.is_empty()
+                        )
+                    }
+                    _ => false,
+                };
+                if indexed_property {
+                    if let BoundExpressionKind::Property {
+                        indices: property_indices,
+                        ..
+                    } = &mut base.kind
+                    {
+                        property_indices.append(&mut indices);
+                    }
+                    base.span = expression.span.clone();
+                    return base;
+                }
+                base =
+                    self.bind_property_use(base, SemanticUse::Value, expression_modes(expression));
                 let ty = base
                     .ty
                     .and_then(|ty| self.binder.types.sequence_element_type(ty));
+                if ty.is_none()
+                    && let Some(base_type) = base.ty
+                    && let Some(symbol) = self.binder.types.default_property(base_type)
+                {
+                    let symbol_kind = self.binder.scopes.symbol(symbol).kind.clone();
+                    return BoundExpression {
+                        kind: BoundExpressionKind::Property {
+                            base: Some(Box::new(base)),
+                            lookup_receiver: None,
+                            symbol,
+                            indices,
+                            binding: None,
+                        },
+                        ty: symbol_kind.ty(),
+                        category: expression_category_for_symbol(&symbol_kind),
+                        semantic_use: SemanticUse::Value,
+                        conversion: None,
+                        span: expression.span.clone(),
+                    };
+                }
                 if ty.is_none() {
                     self.diagnostics.push(Diagnostic::new(
                         expression.span.clone(),
-                        "indexing requires a sequence type",
+                        "indexing requires a sequence type or a default property",
                     ));
                 }
                 let category = if base.category.is_mutable_storage() {
@@ -2267,7 +2793,17 @@ impl CompilationDriver {
         self.note_capture(owner, symbol);
         BoundExpression {
             ty: kind.ty(),
-            kind: BoundExpressionKind::Symbol { symbol, receiver },
+            kind: if matches!(kind, SymbolKind::Property(_)) {
+                BoundExpressionKind::Property {
+                    base: None,
+                    lookup_receiver: receiver,
+                    symbol,
+                    indices: Vec::new(),
+                    binding: None,
+                }
+            } else {
+                BoundExpressionKind::Symbol { symbol, receiver }
+            },
             category: expression_category_for_symbol(&kind),
             semantic_use: SemanticUse::Value,
             conversion: None,
@@ -2285,9 +2821,18 @@ impl CompilationDriver {
             || bound_error(application.span.clone()),
             |target| self.bind_expression_for(target, owner, SemanticUse::AssignmentTarget),
         );
+        let expected_procedure = target
+            .ty
+            .is_some_and(|ty| self.binder.types.callable(ty).is_some());
         let mut source = operands.next().map_or_else(
             || bound_error(application.span.clone()),
-            |source| self.bind_expression_for(source, owner, SemanticUse::Value),
+            |source| {
+                if expected_procedure {
+                    self.bind_expression_without_implicit_call(source, owner, SemanticUse::Value)
+                } else {
+                    self.bind_expression_for(source, owner, SemanticUse::Value)
+                }
+            },
         );
         if operands.next().is_some() || application.operands.len() != 2 {
             self.diagnostics.push(Diagnostic::new(
@@ -2296,6 +2841,12 @@ impl CompilationDriver {
             ));
         }
         let conversion = match (target.ty, source.ty) {
+            (Some(_), Some(_))
+                if matches!(target.kind, BoundExpressionKind::Property { .. })
+                    && target.category.is_assignment_target() =>
+            {
+                self.bind_property_write(&mut target, &mut source, application.modes)
+            }
             (Some(destination), Some(_)) if target.category.is_assignment_target() => self
                 .apply_implicit_conversion(
                     &mut source,
@@ -2328,7 +2879,16 @@ impl CompilationDriver {
         let operands = application
             .operands
             .iter()
-            .map(|operand| self.bind_expression_for(operand, owner, operand_use))
+            .enumerate()
+            .map(|(index, operand)| {
+                if operand_use == SemanticUse::Value
+                    && self.application_operand_expects_procedure_designator(application, index)
+                {
+                    self.bind_expression_without_implicit_call(operand, owner, SemanticUse::Value)
+                } else {
+                    self.bind_expression_for(operand, owner, operand_use)
+                }
+            })
             .collect::<Vec<_>>();
         match &application.callee {
             Callee::Expression(callee) => {
@@ -2400,6 +2960,58 @@ impl CompilationDriver {
                 operands,
                 application.modes,
             ),
+        }
+    }
+
+    fn application_operand_expects_procedure_designator(
+        &self,
+        application: &Application,
+        index: usize,
+    ) -> bool {
+        let Callee::Expression(callee) = &application.callee else {
+            return false;
+        };
+        let ExprKind::Identifier(spelling) = &callee.kind else {
+            return false;
+        };
+        let Some(name) = self.binder.scopes.names().lookup(spelling) else {
+            return false;
+        };
+        let Some(lookup) = self.binder.scopes.lookup_symbol(
+            self.binder.scopes.current_environment(),
+            name,
+            LookupRequest::ORDINARY,
+        ) else {
+            return false;
+        };
+        match self.binder.scopes.symbol(lookup.primary[0].symbol).kind {
+            SymbolKind::Type(destination) => {
+                index == 0 && self.binder.types.callable(destination).is_some()
+            }
+            SymbolKind::Routine(_) => {
+                let mut found = false;
+                for hit in &lookup.primary {
+                    let SymbolKind::Routine(callable_type) =
+                        self.binder.scopes.symbol(hit.symbol).kind
+                    else {
+                        continue;
+                    };
+                    let Some(formal) = self
+                        .binder
+                        .types
+                        .callable(callable_type)
+                        .and_then(|callable| callable.signature.parameters.get(index))
+                    else {
+                        return false;
+                    };
+                    if self.binder.types.callable(formal.ty).is_none() {
+                        return false;
+                    }
+                    found = true;
+                }
+                found
+            }
+            _ => false,
         }
     }
 
@@ -2515,15 +3127,33 @@ impl CompilationDriver {
                 }
             }
             SymbolKind::Property(property)
-                if property.readable && self.binder.types.callable(property.ty).is_some() =>
+                if property.readable() && self.binder.types.callable(property.ty).is_some() =>
             {
                 self.note_capture(owner, primary);
+                let property_expression = BoundExpression {
+                    kind: BoundExpressionKind::Property {
+                        base: None,
+                        lookup_receiver: primary_receiver,
+                        symbol: primary,
+                        indices: Vec::new(),
+                        binding: None,
+                    },
+                    ty: Some(property.ty),
+                    category: expression_category_for_symbol(&SymbolKind::Property(
+                        property.clone(),
+                    )),
+                    semantic_use: SemanticUse::Value,
+                    conversion: None,
+                    span: span.clone(),
+                };
+                let property_expression =
+                    self.bind_property_use(property_expression, SemanticUse::Value, modes);
                 let resolution = self.resolve_application(
                     vec![ApplicationCandidate::CallableValue {
-                        symbol: Some(primary),
+                        symbol: None,
                         callable_type: property.ty,
                         receiver: ApplicationReceiver::CallableValue {
-                            lookup_receiver: primary_receiver,
+                            lookup_receiver: None,
                         },
                     }],
                     &operands,
@@ -2538,7 +3168,7 @@ impl CompilationDriver {
                 BoundExpression {
                     kind: BoundExpressionKind::Application {
                         target: BoundApplicationTarget::CallableValue { resolution },
-                        callee: None,
+                        callee: Some(Box::new(property_expression)),
                         operands,
                         modes,
                     },
@@ -3096,12 +3726,20 @@ fn semantic_calling_convention(syntax: CallingConventionSyntax) -> CallingConven
     }
 }
 
+fn expression_modes(expression: &Expr) -> crate::ModeSnapshot {
+    match &expression.kind {
+        ExprKind::Application(application) => application.modes,
+        ExprKind::Index { modes, .. } => *modes,
+        _ => crate::ModeSnapshot::default(),
+    }
+}
+
 fn expression_category_for_symbol(kind: &SymbolKind) -> ExpressionCategory {
     match kind {
         SymbolKind::Variable(_) => ExpressionCategory::Storage { mutable: true },
         SymbolKind::Property(property) => ExpressionCategory::Property {
-            readable: property.readable,
-            writable: property.writable,
+            readable: property.readable(),
+            writable: property.writable(),
         },
         SymbolKind::Type(_)
         | SymbolKind::Routine(_)
@@ -3424,17 +4062,99 @@ fn install_builtins(binder: &mut SemanticBinder) -> BuiltinTypes {
             alignment: 1,
         },
     );
+    let wide_character = primitive(
+        binder,
+        "widechar",
+        PrimitiveKind::WideCharacter { bits: 16 },
+        StorageLayout {
+            size: 2,
+            alignment: 2,
+        },
+    );
+    let real = primitive(
+        binder,
+        "real",
+        PrimitiveKind::Real { bits: 64 },
+        StorageLayout {
+            size: 8,
+            alignment: 8,
+        },
+    );
     let string_name = binder.scopes.intern_name("string");
-    let string = binder
-        .define_type(string_name, opaque_type())
-        .expect("builtin names are unique")
-        .ty;
-    for name in ["pointer", "ansistring", "widestring", "unicodeString"] {
+    let _string = binder
+        .define_type(
+            string_name,
+            StringType {
+                kind: StringKind::Short,
+                capacity: Some(255),
+                element: character,
+                index: integer,
+                length: integer,
+                layout: StorageLayout {
+                    size: 256,
+                    alignment: 1,
+                },
+            },
+        )
+        .expect("builtin names are unique");
+    let short_string_name = binder.scopes.intern_name("shortstring");
+    let _ = binder
+        .define_type(
+            short_string_name,
+            AliasType {
+                target: _string.ty,
+                nominal: false,
+            },
+        )
+        .expect("builtin names are unique");
+    let pointer_name = binder.scopes.intern_name("pointer");
+    let _pointer = binder
+        .define_type(
+            pointer_name,
+            UntypedPointerType {
+                layout: pointer_layout(),
+            },
+        )
+        .expect("builtin names are unique");
+    for (name, kind, element) in [
+        ("ansistring", StringKind::Ansi, character),
+        ("utf8string", StringKind::Utf8, character),
+        ("widestring", StringKind::Wide, wide_character),
+        ("unicodestring", StringKind::Unicode, wide_character),
+    ] {
         let name = binder.scopes.intern_name(name);
         let _ = binder
-            .define_type(name, opaque_type())
+            .define_type(
+                name,
+                StringType {
+                    kind,
+                    capacity: None,
+                    element,
+                    index: integer,
+                    length: integer,
+                    layout: pointer_layout(),
+                },
+            )
             .expect("builtin names are unique");
     }
+    let tmethod = binder.scopes.intern_name("tmethod");
+    let _ = binder
+        .define_type(
+            tmethod,
+            RawMethodType {
+                layout: StorageLayout {
+                    size: 16,
+                    alignment: 8,
+                },
+            },
+        )
+        .expect("builtin names are unique");
+    let nil = binder.types.allocate_complete(
+        TypeOwner::Builtin,
+        None,
+        binder.scopes.current_environment(),
+        NilType,
+    );
     let untyped_parameter = binder.types.allocate_complete(
         TypeOwner::Builtin,
         None,
@@ -3449,9 +4169,10 @@ fn install_builtins(binder: &mut SemanticBinder) -> BuiltinTypes {
     );
     BuiltinTypes {
         integer,
+        real,
         boolean,
         character,
-        string,
+        nil,
         untyped_parameter,
     }
 }

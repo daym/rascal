@@ -28,8 +28,9 @@ pub use conversion::{
 };
 pub use expressions::{
     BoundApplicationTarget, BoundAssignment, BoundBody, BoundCaseArm, BoundCaseLabel,
-    BoundExceptionHandler, BoundExpression, BoundExpressionKind, BoundSetElement, BoundStatement,
-    BoundStatementKind, BoundTryContinuation, ExpressionCategory, SemanticUse,
+    BoundExceptionHandler, BoundExpression, BoundExpressionKind, BoundPropertyBinding,
+    BoundSetElement, BoundStatement, BoundStatementKind, BoundTryContinuation, ExpressionCategory,
+    PropertyAccessKind, SemanticUse,
 };
 pub use frontend::{BoundFile, SemanticCompilation, bind_sources};
 pub use ids::{
@@ -42,16 +43,18 @@ pub use modules::{
 pub use scope::{
     DeclarationMode, DeclarationState, DeclareError, EnvironmentCheckpoint, FrameKind,
     LookupBarrier, LookupEdge, LookupEdgeKind, LookupHit, LookupRequest, LookupResult, LookupStep,
-    NameInterner, PropertySymbol, RegionOwner, ScopeGraph, Symbol, SymbolCategory, SymbolFilter,
-    SymbolKind,
+    NameInterner, PropertyAccessor, PropertySymbol, RegionOwner, ScopeGraph, Symbol,
+    SymbolCategory, SymbolFilter, SymbolKind,
 };
 pub use types::{
     AccessKind, AggregateShape, AliasType, ArrayType, CallableFlavor, CallableType,
     CallingConvention, Capture, ClassType, ConversionRank, EnumMember, EnumType,
     EnvironmentRequirement, ExplicitConversion, Field, FieldLayout, FormalParameter,
-    IncompleteReason, ObjectType, OpaqueType, OrdinalDomain, PackedRecordType, ParameterMode,
-    PascalType, Place, PointerType, PrimitiveKind, PrimitiveType, RangeCheck, RegularRecordType,
-    RoutineOwner, RoutineSignature, SetType, StorageBase, StorageLayout, StringKind, StringType,
-    SubrangeType, TypeEntry, TypeOwner, TypeQuery, TypeRegistry, TypeRegistryError, TypeState,
-    UnitType, ValueConversion, ValueConversionOperation, VariantAlternative, VariantPart,
+    IncompleteReason, InterfaceType, MetaClassType, NilType, ObjectType, OpaqueType, OrdinalDomain,
+    PackedRecordType, ParameterMode, PascalType, Place, PointerType, PrimitiveKind, PrimitiveType,
+    ProcedurePointerTargetAbi, RangeCheck, RawMethodType, RegularRecordType, RoutineOwner,
+    RoutineSignature, SetType, StorageBase, StorageLayout, StringKind, StringLiteralType,
+    StringType, SubrangeType, TypeEntry, TypeOwner, TypeQuery, TypeRegistry, TypeRegistryError,
+    TypeState, UnitType, UntypedPointerType, ValueConversion, ValueConversionOperation,
+    VariantAlternative, VariantPart,
 };

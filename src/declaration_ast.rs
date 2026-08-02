@@ -83,6 +83,12 @@ pub struct VariantPartSyntax {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TypeSyntaxKind {
     Named(Vec<SpannedName>),
+    /// A target-backend spelling carried by the RTL declaration. Semantic
+    /// binding decides the Pascal type; the frontend must not interpret this
+    /// string as a Pascal identifier.
+    External {
+        backend_name: String,
+    },
     Pointer(Box<TypeSyntax>),
     Enumeration(Vec<EnumMemberSyntax>),
     Subrange {
@@ -126,6 +132,8 @@ pub struct ValueDeclarationSyntax {
     pub names: Vec<SpannedName>,
     pub ty: Option<TypeSyntax>,
     pub initializer: Option<Expr>,
+    /// Raw backend-specific spelling from `external name '...'`.
+    pub external_name: Option<String>,
     pub span: Span,
     pub modes: ModeSnapshot,
 }
@@ -153,6 +161,10 @@ pub struct RoutineDeclarationSyntax {
     pub body_tokens: Vec<Token>,
     pub has_body: bool,
     pub is_forward: bool,
+    pub is_external: bool,
+    /// Raw backend-specific spelling from `external name '...'`. Lowering,
+    /// rather than Pascal name lookup, owns its interpretation.
+    pub external_name: Option<String>,
     pub overload: bool,
     pub class_method: bool,
     pub static_method: bool,

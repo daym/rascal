@@ -91,6 +91,7 @@ fn every_extracted_pascal_fixture_reaches_the_semantic_boundary() {
     files.sort();
 
     let mut failures = Vec::new();
+    let mut sources = Vec::new();
     for path in files {
         let source = fs::read_to_string(&path).unwrap();
         let parsed = pascal_parser::parse(&source);
@@ -106,10 +107,27 @@ fn every_extracted_pascal_fixture_reaches_the_semantic_boundary() {
             ));
             continue;
         }
-        let source_name = path.to_string_lossy();
-        let compilation = semantic::bind_sources(&[(&source_name, &source)]);
-        if compilation.files.len() != 1 {
-            failures.push((path, "semantic binder did not return one file".to_owned()));
+        sources.push((path, source));
+    }
+    // Binding a batch shares one source-bound System prelude. The corpus test
+    // checks that every fixture crosses the boundary, not unit-link validity.
+    for chunk in sources.chunks(64) {
+        let names = chunk
+            .iter()
+            .map(|(path, source)| (path.to_string_lossy().into_owned(), source.as_str()))
+            .collect::<Vec<_>>();
+        let views = names
+            .iter()
+            .map(|(name, source)| (name.as_str(), *source))
+            .collect::<Vec<_>>();
+        let compilation = semantic::bind_sources(&views);
+        if compilation.files.len() != chunk.len() {
+            for (path, _) in chunk {
+                failures.push((
+                    path.clone(),
+                    "semantic binder did not return the batched file".to_owned(),
+                ));
+            }
         }
     }
     assert!(

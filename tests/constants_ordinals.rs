@@ -255,10 +255,13 @@ fn parameterized_builtin_contracts_share_constant_and_runtime_binding() {
         .unwrap()
         .primary[0]
         .symbol;
-    let SymbolKind::Builtin(high_family) = compilation.binder.scopes.symbol(high_symbol).kind
-    else {
-        panic!("System.High must be a parameterized builtin declaration")
+    let SymbolKind::Routine(_) = compilation.binder.scopes.symbol(high_symbol).kind else {
+        panic!("System.High must remain the ordinary routine declared by rtl/system.pp")
     };
+    let high_family = compilation
+        .builtin_families
+        .family_for_symbol(high_symbol)
+        .expect("System.High has parameterized semantic metadata");
     assert_eq!(
         compilation.builtin_families.get(high_family).contract,
         BuiltinContract::Metadata(MetadataQuery::High)

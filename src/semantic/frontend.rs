@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::OnceLock,
+};
 
 use crate::{
     Application, Callee, CaseLabel, Diagnostic, Expr, ExprKind, Literal, Operator,
@@ -81,6 +84,38 @@ struct ParsedInput {
     module: Option<ModuleId>,
 }
 
+fn system_declarations() -> &'static crate::declaration_ast::DeclarationParseOutput {
+    static DECLARATIONS: OnceLock<crate::declaration_ast::DeclarationParseOutput> = OnceLock::new();
+    DECLARATIONS.get_or_init(|| {
+        let lexed = crate::preprocess(
+            "rtl/system.pp",
+            include_str!("../../rtl/system.pp"),
+            &crate::PreprocessorOptions::default(),
+        );
+        assert!(
+            lexed.diagnostics.is_empty(),
+            "bundled rtl/system.pp must preprocess cleanly: {:#?}",
+            lexed.diagnostics
+        );
+        let parsed = pascal_parser::parse_tokens(&lexed.tokens, lexed.logical_len);
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "bundled rtl/system.pp must parse cleanly: {:#?}",
+            parsed.diagnostics
+        );
+        let file = parsed
+            .file
+            .expect("bundled rtl/system.pp must produce a unit syntax tree");
+        let declarations = parse_file_declarations(&file);
+        assert!(
+            declarations.diagnostics.is_empty(),
+            "bundled rtl/system.pp declarations must parse cleanly: {:#?}",
+            declarations.diagnostics
+        );
+        declarations
+    })
+}
+
 #[derive(Clone, Copy)]
 struct ResolvedParameter {
     name: NameId,
@@ -101,6 +136,8 @@ struct CompilationDriver {
     diagnostics: Vec<Diagnostic>,
     bodies: Vec<BoundBody>,
     builtins: BuiltinTypes,
+    intrinsic_types: EnvironmentId,
+    binding_system: bool,
     system_module: ModuleId,
     system_exports: EnvironmentId,
     routine_forwards: BTreeMap<(super::RegionId, NameId), DeclaredRoutine>,
@@ -114,19 +151,24 @@ struct CompilationDriver {
 impl CompilationDriver {
     fn new() -> Self {
         let mut binder = SemanticBinder::new();
-        let builtins = install_builtins(&mut binder);
-        let mut builtin_families = BuiltinRegistry::default();
-        install_system_builtins(&mut binder, &mut builtin_families);
-        let root_region = binder
+        let (_, intrinsic_entry) = binder
             .scopes
-            .environment_region(binder.scopes.current_environment());
-        let system_exports = binder.scopes.create_region_view(root_region, Vec::new());
+            .create_detached_region(RegionOwner::Block(u32::MAX), Vec::new());
+        binder.scopes.select_environment(intrinsic_entry);
+        let builtins = install_builtins(&mut binder);
+        let intrinsic_types = binder.scopes.current_environment();
+        let builtin_families = BuiltinRegistry::default();
         let system_name = binder.scopes.intern_name("System");
         let mut modules = ModuleRegistry::new();
-        let system_module = modules.add_module(system_name, system_exports);
+        let predicted = ModuleId::from_index(0);
+        let (_, system_local) = binder
+            .scopes
+            .create_detached_region(RegionOwner::Module(predicted), Vec::new());
+        let system_module = modules.add_module(system_name, system_local);
+        debug_assert_eq!(system_module, predicted);
         let mut module_names = BTreeMap::new();
         module_names.insert("system".to_owned(), system_module);
-        Self {
+        let mut driver = Self {
             binder,
             builtin_families,
             modules,
@@ -134,15 +176,59 @@ impl CompilationDriver {
             diagnostics: Vec::new(),
             bodies: Vec::new(),
             builtins,
+            intrinsic_types,
+            binding_system: false,
             system_module,
-            system_exports,
+            system_exports: system_local,
             routine_forwards: BTreeMap::new(),
             next_anonymous_type: 0,
             next_receiver: 0,
             next_block: 0,
             loop_depth: 0,
             active_routines: Vec::new(),
+        };
+        driver.bind_system_rtl(system_local);
+        driver
+    }
+
+    fn bind_system_rtl(&mut self, local: EnvironmentId) {
+        let declarations = system_declarations();
+        self.binder.scopes.select_environment(local);
+        self.binding_system = true;
+        if let Some(interface) = declarations
+            .sections
+            .iter()
+            .find(|section| section.kind == PascalSectionKind::Interface)
+        {
+            self.bind_declarations(&interface.declarations, RoutineOwner::Module, None);
         }
+        self.binding_system = false;
+        let region = self.binder.scopes.environment_region(local);
+        let exports = self.binder.scopes.create_region_view(region, Vec::new());
+        self.modules
+            .set_interface_exports(self.system_module, exports);
+        self.system_exports = exports;
+        self.builtins.integer = self.system_declared_type(exports, "integer");
+        self.builtins.long_integer = self.system_declared_type(exports, "longint");
+        self.builtins.real = self.system_declared_type(exports, "real");
+        self.builtins.boolean = self.system_declared_type(exports, "boolean");
+        self.builtins.character = self.system_declared_type(exports, "char");
+        self.builtins.byte = self.system_declared_type(exports, "byte");
+        self.builtins.word = self.system_declared_type(exports, "word");
+        self.builtins.size_unsigned = self.system_declared_type(exports, "sizeuint");
+    }
+
+    fn system_declared_type(&mut self, exports: EnvironmentId, spelling: &str) -> TypeRef {
+        let name = self.binder.scopes.intern_name(spelling);
+        let lookup = self
+            .binder
+            .scopes
+            .lookup_symbol(exports, name, LookupRequest::REQUIRED_TYPE)
+            .unwrap_or_else(|| panic!("rtl/system.pp must declare `{spelling}`"));
+        let SymbolKind::Type(ty) = self.binder.scopes.symbol(lookup.primary[0].symbol).kind else {
+            panic!("rtl/system.pp `{spelling}` must be a type declaration");
+        };
+        ty
     }
 
     fn register_modules(&mut self, inputs: &mut [ParsedInput]) {
@@ -386,10 +472,12 @@ impl CompilationDriver {
                     }
                 }
                 DeclarationSyntax::Unsupported { span, .. } => {
-                    self.diagnostics.push(Diagnostic::new(
-                        span.clone(),
-                        "unsupported declaration retained by the CST-to-semantic boundary",
-                    ));
+                    if !self.binding_system {
+                        self.diagnostics.push(Diagnostic::new(
+                            span.clone(),
+                            "unsupported declaration retained by the CST-to-semantic boundary",
+                        ));
+                    }
                 }
             }
         }
@@ -398,6 +486,18 @@ impl CompilationDriver {
     fn bind_type_declaration(&mut self, declaration: &TypeDeclarationSyntax) {
         let name = self.binder.scopes.intern_name(&declaration.name.spelling);
         match &declaration.ty.kind {
+            TypeSyntaxKind::External { .. } => {
+                let target = self.system_external_type(name);
+                if let Err(error) = self.binder.define_type(
+                    name,
+                    AliasType {
+                        target,
+                        nominal: false,
+                    },
+                ) {
+                    self.bind_error(declaration.span.clone(), error);
+                }
+            }
             TypeSyntaxKind::ClassForward => {
                 if let Err(error) = self
                     .binder
@@ -559,10 +659,12 @@ impl CompilationDriver {
                 }
             }
             TypeSyntaxKind::Unsupported(_) => {
-                self.diagnostics.push(Diagnostic::new(
-                    declaration.ty.span.clone(),
-                    "unsupported type syntax bound as an opaque error type",
-                ));
+                if !self.binding_system {
+                    self.diagnostics.push(Diagnostic::new(
+                        declaration.ty.span.clone(),
+                        "unsupported type syntax bound as an opaque error type",
+                    ));
+                }
                 if let Err(error) = self.binder.define_type(name, opaque_type()) {
                     self.bind_error(declaration.span.clone(), error);
                 }
@@ -847,6 +949,7 @@ impl CompilationDriver {
                 names: vec![selector.clone()],
                 ty: Some((*syntax.selector_type).clone()),
                 initializer: None,
+                external_name: None,
                 span: selector.span.clone(),
                 modes: syntax.selector_type.modes,
             };
@@ -1344,12 +1447,69 @@ impl CompilationDriver {
         let Some(declared) = declared else {
             return;
         };
-        if routine.is_forward {
+        if self.binding_system {
+            self.attach_system_builtin(routine, declared);
+        }
+        if routine.is_forward && !routine.is_external {
             self.routine_forwards.insert(key, declared);
         }
         if routine.has_body {
             self.bind_routine_body(routine, declared, &parameters, result);
         }
+    }
+
+    fn attach_system_builtin(
+        &mut self,
+        routine: &RoutineDeclarationSyntax,
+        declared: DeclaredRoutine,
+    ) {
+        let canonical_name = self
+            .binder
+            .scopes
+            .names()
+            .spelling(self.binder.scopes.symbol(declared.symbol).name);
+        let generic = routine
+            .parameters
+            .iter()
+            .any(|parameter| parameter.ty.is_none());
+        let contract = if routine.kind == RoutineSyntaxKind::Operator {
+            system_operator_contract(canonical_name)
+        } else {
+            match canonical_name {
+                "low" => Some(BuiltinContract::Metadata(MetadataQuery::Low)),
+                "high" => Some(BuiltinContract::Metadata(MetadataQuery::High)),
+                "sizeof" => Some(BuiltinContract::Metadata(MetadataQuery::SizeOf)),
+                "length" if generic => Some(BuiltinContract::Metadata(MetadataQuery::Length)),
+                "odd" => Some(BuiltinContract::Ordinal(OrdinalOperation::Odd)),
+                "ord" => Some(BuiltinContract::Ordinal(OrdinalOperation::Ord)),
+                "chr" => Some(BuiltinContract::Ordinal(OrdinalOperation::Chr)),
+                "pred" => Some(BuiltinContract::Ordinal(OrdinalOperation::Pred)),
+                "succ" => Some(BuiltinContract::Ordinal(OrdinalOperation::Succ)),
+                "abs" => Some(BuiltinContract::Numeric(NumericOperation::Abs)),
+                "sqr" => Some(BuiltinContract::Numeric(NumericOperation::Sqr)),
+                "inc" => Some(BuiltinContract::StepMutation(StepOperation::Increment)),
+                "dec" => Some(BuiltinContract::StepMutation(StepOperation::Decrement)),
+                _ => None,
+            }
+        };
+        let Some(contract) = contract else {
+            return;
+        };
+        let declared_signature = (!generic).then(|| {
+            self.binder
+                .types
+                .callable(declared.ty)
+                .expect("declared routine has a callable type")
+                .signature
+                .clone()
+        });
+        self.builtin_families.attach(
+            declared.symbol,
+            BuiltinFamilyDecl {
+                contract,
+                declared_signature,
+            },
+        );
     }
 
     fn inherited_method_matches(
@@ -3443,8 +3603,7 @@ impl CompilationDriver {
                     .iter()
                     .chain(result.shadowed.iter().flatten())
                     .any(|hit| {
-                        let SymbolKind::Builtin(family) =
-                            self.binder.scopes.symbol(hit.symbol).kind
+                        let Some(family) = self.builtin_families.family_for_symbol(hit.symbol)
                         else {
                             return false;
                         };
@@ -3492,7 +3651,11 @@ impl CompilationDriver {
         let primary = result.primary[0].symbol;
         let primary_receiver = result.primary[0].receiver;
         let primary_kind = self.binder.scopes.symbol(primary).kind.clone();
-        let builtin_target = matches!(primary_kind, SymbolKind::Builtin(_));
+        let builtin_target = result.primary.iter().any(|hit| {
+            self.builtin_families
+                .family_for_symbol(hit.symbol)
+                .is_some()
+        });
         match primary_kind {
             SymbolKind::Type(destination) => {
                 let resolution = self.resolve_application(
@@ -3523,7 +3686,7 @@ impl CompilationDriver {
                     span,
                 }
             }
-            SymbolKind::Routine(_) | SymbolKind::Builtin(_) => {
+            SymbolKind::Routine(_) => {
                 let candidates = self.callable_candidates(&result, &operands, modes, owner);
                 let resolution = self.resolve_application(candidates, &operands, modes);
                 self.report_application_resolution(
@@ -4031,6 +4194,19 @@ impl CompilationDriver {
                 }
                 match self.binder.scopes.symbol(hit.symbol).kind {
                     SymbolKind::Routine(callable_type) => {
+                        if let Some(family) = self.builtin_families.family_for_symbol(hit.symbol) {
+                            let instantiation = self.builtin_families.get(family).instantiate(
+                                &actuals,
+                                &self.binder.types,
+                                builtin_types,
+                                modes,
+                            );
+                            return Some(ApplicationCandidate::Builtin {
+                                symbol: hit.symbol,
+                                family,
+                                instantiation,
+                            });
+                        }
                         let flavor = self.binder.types.callable(callable_type)?.flavor;
                         let implicit_self = current_callable
                             .and_then(|current| self.binder.types.callable(current))
@@ -4039,19 +4215,6 @@ impl CompilationDriver {
                             symbol: hit.symbol,
                             callable_type,
                             receiver: declared_receiver(flavor, hit.receiver, implicit_self),
-                        })
-                    }
-                    SymbolKind::Builtin(family) => {
-                        let instantiation = self.builtin_families.get(family).instantiate(
-                            &actuals,
-                            &self.binder.types,
-                            builtin_types,
-                            modes,
-                        );
-                        Some(ApplicationCandidate::Builtin {
-                            symbol: hit.symbol,
-                            family,
-                            instantiation,
                         })
                     }
                     _ => None,
@@ -4182,6 +4345,7 @@ impl CompilationDriver {
     fn resolve_type(&mut self, syntax: &TypeSyntax) -> Option<TypeRef> {
         match &syntax.kind {
             TypeSyntaxKind::Named(path) => self.resolve_named_type(path, syntax.span.clone()),
+            TypeSyntaxKind::External { .. } => Some(self.allocate_anonymous(opaque_type())),
             TypeSyntaxKind::Pointer(target) => {
                 let target = self.resolve_type(target)?;
                 Some(self.allocate_anonymous(PointerType {
@@ -4387,6 +4551,41 @@ impl CompilationDriver {
         )
     }
 
+    fn system_external_type(&mut self, name: NameId) -> TypeRef {
+        if let Some(lookup) = self.binder.scopes.lookup_symbol(
+            self.intrinsic_types,
+            name,
+            LookupRequest::REQUIRED_TYPE,
+        ) && let SymbolKind::Type(ty) = self.binder.scopes.symbol(lookup.primary[0].symbol).kind
+        {
+            return ty;
+        }
+        match self.binder.scopes.names().spelling(name) {
+            "single" => self.allocate_anonymous(PrimitiveType {
+                kind: PrimitiveKind::Real { bits: 32 },
+                layout: StorageLayout {
+                    size: 4,
+                    alignment: 4,
+                },
+            }),
+            "double" => self.allocate_anonymous(PrimitiveType {
+                kind: PrimitiveKind::Real { bits: 64 },
+                layout: StorageLayout {
+                    size: 8,
+                    alignment: 8,
+                },
+            }),
+            "extended" => self.allocate_anonymous(PrimitiveType {
+                kind: PrimitiveKind::Real { bits: 80 },
+                layout: StorageLayout {
+                    size: 16,
+                    alignment: 16,
+                },
+            }),
+            _ => self.allocate_anonymous(opaque_type()),
+        }
+    }
+
     fn define_error_type(&mut self, name: NameId, span: Span) {
         if let Err(error) = self.binder.define_type(name, opaque_type()) {
             self.bind_error(span, error);
@@ -4426,6 +4625,36 @@ fn routine_declaration_mode(routine: &RoutineDeclarationSyntax) -> DeclarationMo
     }
 }
 
+fn system_operator_contract(canonical_name: &str) -> Option<BuiltinContract> {
+    let operator = match canonical_name {
+        "&op_checkedaddition" | "&op_addition" => Operator::Add,
+        "&op_checkedsubtraction" | "&op_subtraction" => Operator::Subtract,
+        "&op_checkedmultiply" | "&op_multiply" => Operator::Multiply,
+        "&op_checkedintdivide" | "&op_intdivide" => Operator::IntegerDivide,
+        "&op_division" => Operator::RealDivide,
+        "&op_modulus" => Operator::Modulo,
+        "&op_leftshift" => Operator::ShiftLeft,
+        "&op_rightshift" => Operator::ShiftRight,
+        "&op_checkedunarynegation" | "&op_unarynegation" => Operator::Negative,
+        "&op_unaryplus" => Operator::Positive,
+        "&op_logicalnot" => Operator::Not,
+        "&op_equality" => Operator::Equal,
+        "&op_inequality" => Operator::NotEqual,
+        "&op_greaterthan" => Operator::Greater,
+        "&op_greaterthanorequal" => Operator::GreaterEqual,
+        "&op_lessthan" => Operator::Less,
+        "&op_lessthanorequal" => Operator::LessEqual,
+        "&op_logicaland" | "&op_bitwiseand" => Operator::And,
+        "&op_logicalor" | "&op_bitwiseor" => Operator::Or,
+        "&op_logicalxor" | "&op_bitwisexor" => Operator::Xor,
+        "&op_in" => Operator::In,
+        // Implicit/explicit declarations are conversions, not assignment.
+        "&op_checkedimplicit" | "&op_implicit" | "&op_explicit" => return None,
+        _ => return None,
+    };
+    Some(BuiltinContract::Operator(operator))
+}
+
 fn semantic_calling_convention(syntax: CallingConventionSyntax) -> CallingConvention {
     match syntax {
         CallingConventionSyntax::Pascal => CallingConvention::Pascal,
@@ -4452,7 +4681,6 @@ fn expression_category_for_symbol(kind: &SymbolKind) -> ExpressionCategory {
         },
         SymbolKind::Type(_)
         | SymbolKind::Routine(_)
-        | SymbolKind::Builtin(_)
         | SymbolKind::Constant(_)
         | SymbolKind::Label => ExpressionCategory::Value,
     }
@@ -4522,143 +4750,6 @@ fn opaque_type() -> OpaqueType {
         layout: None,
         reference_type: false,
         managed_lifetime: false,
-    }
-}
-
-fn install_system_builtins(binder: &mut SemanticBinder, registry: &mut BuiltinRegistry) {
-    fn family(
-        binder: &mut SemanticBinder,
-        registry: &mut BuiltinRegistry,
-        spelling: &str,
-        contract: BuiltinContract,
-    ) {
-        let name = binder.scopes.intern_name(spelling);
-        let declaration = registry.register(BuiltinFamilyDecl { contract });
-        binder
-            .scopes
-            .declare(
-                name,
-                SymbolKind::Builtin(declaration),
-                DeclarationState::Complete,
-                DeclarationMode::Overload,
-            )
-            .expect("System builtin declarations are overload-compatible");
-    }
-
-    fn operator_family(
-        binder: &mut SemanticBinder,
-        registry: &mut BuiltinRegistry,
-        operator: Operator,
-        checks_enabled: bool,
-        logical_operands: bool,
-    ) {
-        let unary = matches!(
-            operator,
-            Operator::Positive | Operator::Negative | Operator::Not
-        );
-        let invocation = if unary {
-            OperatorInvocation::UnaryToken
-        } else {
-            OperatorInvocation::BinaryToken
-        };
-        let arity = if unary { 1 } else { 2 };
-        let identifier = operator_invocation_identifier(
-            invocation,
-            operator.spelling(),
-            arity,
-            checks_enabled,
-            logical_operands,
-        )
-        .expect("System operator has a catalog identity");
-        family(
-            binder,
-            registry,
-            identifier,
-            BuiltinContract::Operator(operator),
-        );
-    }
-
-    for operator in [
-        Operator::Add,
-        Operator::Subtract,
-        Operator::Multiply,
-        Operator::IntegerDivide,
-    ] {
-        for checks_enabled in [false, true] {
-            operator_family(binder, registry, operator, checks_enabled, false);
-        }
-    }
-    for operator in [
-        Operator::RealDivide,
-        Operator::Modulo,
-        Operator::ShiftLeft,
-        Operator::ShiftRight,
-    ] {
-        operator_family(binder, registry, operator, false, false);
-    }
-    for checks_enabled in [false, true] {
-        operator_family(binder, registry, Operator::Negative, checks_enabled, false);
-    }
-    operator_family(binder, registry, Operator::Positive, false, false);
-    for operator in [
-        Operator::Equal,
-        Operator::NotEqual,
-        Operator::Less,
-        Operator::Greater,
-        Operator::LessEqual,
-        Operator::GreaterEqual,
-    ] {
-        operator_family(binder, registry, operator, false, false);
-    }
-    for operator in [Operator::And, Operator::Or, Operator::Xor] {
-        operator_family(binder, registry, operator, false, false);
-        operator_family(binder, registry, operator, false, true);
-    }
-    operator_family(binder, registry, Operator::Not, false, true);
-
-    for (spelling, query) in [
-        ("low", MetadataQuery::Low),
-        ("high", MetadataQuery::High),
-        ("sizeof", MetadataQuery::SizeOf),
-        ("length", MetadataQuery::Length),
-    ] {
-        family(binder, registry, spelling, BuiltinContract::Metadata(query));
-    }
-    for (spelling, operation) in [
-        ("odd", OrdinalOperation::Odd),
-        ("ord", OrdinalOperation::Ord),
-        ("chr", OrdinalOperation::Chr),
-        ("pred", OrdinalOperation::Pred),
-        ("succ", OrdinalOperation::Succ),
-    ] {
-        family(
-            binder,
-            registry,
-            spelling,
-            BuiltinContract::Ordinal(operation),
-        );
-    }
-    for (spelling, operation) in [
-        ("abs", NumericOperation::Abs),
-        ("sqr", NumericOperation::Sqr),
-    ] {
-        family(
-            binder,
-            registry,
-            spelling,
-            BuiltinContract::Numeric(operation),
-        );
-    }
-    for (spelling, operation) in [
-        ("inc", StepOperation::Increment),
-        ("dec", StepOperation::Decrement),
-    ] {
-        family(
-            binder,
-            registry,
-            spelling,
-            BuiltinContract::StepMutation(operation),
-        );
     }
 }
 

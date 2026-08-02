@@ -196,15 +196,10 @@ fn constexp_slice_binds_variant_record_procvar_and_custom_operator() {
     ));
     assert!(
         resolution.attempts.iter().any(|attempt| {
-            matches!(
-                attempt.candidate,
-                ApplicationCandidate::Builtin {
-                    instantiation: BuiltinInstantiation::Rejected(_),
-                    ..
-                }
-            ) && !attempt.is_viable()
+            matches!(attempt.candidate, ApplicationCandidate::Builtin { .. })
+                && !attempt.is_viable()
         }),
-        "the rejected parameterized System candidate must remain beside the selected custom operator"
+        "rejected source-declared System candidates must remain beside the selected custom operator"
     );
     let selected = resolution.selected_symbol().unwrap();
     let declared_name = compilation.binder.scopes.symbol(selected).name;

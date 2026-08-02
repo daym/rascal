@@ -1,8 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::ids::{
-    BuiltinFamilyId, EnvironmentId, ModuleId, NameId, ReceiverId, RegionId, SymbolId, TypeRef,
-    TypeSectionId,
+    EnvironmentId, ModuleId, NameId, ReceiverId, RegionId, SymbolId, TypeRef, TypeSectionId,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -71,7 +70,6 @@ impl SymbolFilter {
 pub enum SymbolKind {
     Type(TypeRef),
     Routine(TypeRef),
-    Builtin(BuiltinFamilyId),
     Constant(TypeRef),
     Variable(TypeRef),
     Property(PropertySymbol),
@@ -82,7 +80,7 @@ impl SymbolKind {
     pub const fn category(&self) -> SymbolCategory {
         match self {
             Self::Type(_) => SymbolCategory::Type,
-            Self::Routine(_) | Self::Builtin(_) => SymbolCategory::Routine,
+            Self::Routine(_) => SymbolCategory::Routine,
             Self::Constant(_) => SymbolCategory::Constant,
             Self::Variable(_) => SymbolCategory::Variable,
             Self::Property(_) => SymbolCategory::Property,
@@ -96,7 +94,7 @@ impl SymbolKind {
                 Some(*ty)
             }
             Self::Property(property) => Some(property.ty),
-            Self::Builtin(_) | Self::Label => None,
+            Self::Label => None,
         }
     }
 }

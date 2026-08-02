@@ -453,6 +453,19 @@ fn parse_type_syntax(tokens: &[Token]) -> TypeSyntax {
     );
     let tokens = &tokens[distinct_offset..];
 
+    if tokens.len() == 3
+        && is_keyword(&tokens[0], "external")
+        && is_keyword(&tokens[1], "name")
+        && let TokenKind::String(backend_name) = &tokens[2].kind
+    {
+        return TypeSyntax {
+            kind: TypeSyntaxKind::External {
+                backend_name: backend_name.clone(),
+            },
+            span,
+            modes,
+        };
+    }
     if tokens.len() == 1 && is_keyword(&tokens[0], "class") {
         return TypeSyntax {
             kind: TypeSyntaxKind::ClassForward,
@@ -733,6 +746,7 @@ fn parse_value_declaration(tokens: &[Token], constant: bool) -> Option<ValueDecl
             token.kind == TokenKind::Equal
                 || token.kind == TokenKind::Assign
                 || is_keyword(token, "absolute")
+                || is_keyword(token, "external")
                 || is_keyword(token, "read")
                 || is_keyword(token, "write")
                 || is_keyword(token, "stored")
@@ -760,10 +774,20 @@ fn parse_value_declaration(tokens: &[Token], constant: bool) -> Option<ValueDecl
             .then(|| expression_syntax(&tokens[start..end]))
             .flatten()
     });
+    let external_name = tokens.windows(3).find_map(|window| {
+        if !is_keyword(&window[0], "external") || !is_keyword(&window[1], "name") {
+            return None;
+        }
+        let TokenKind::String(name) = &window[2].kind else {
+            return None;
+        };
+        Some(name.clone())
+    });
     Some(ValueDeclarationSyntax {
         names: names?,
         ty,
         initializer,
+        external_name,
         span: token_span(tokens, 0),
         modes: tokens
             .first()
@@ -1238,6 +1262,8 @@ impl<'a> DeclarationScanner<'a> {
         let header_end = first_semicolon(self.tokens, start);
         let mut cursor = (header_end + 1).min(self.tokens.len());
         let mut is_forward = false;
+        let mut is_external = false;
+        let mut external_name = None;
         let mut overload = kind == RoutineSyntaxKind::Operator;
         let mut static_method = false;
         let mut virtual_method = false;
@@ -1263,10 +1289,27 @@ impl<'a> DeclarationScanner<'a> {
                 "static",
                 "final",
                 "reintroduce",
+                "noreturn",
             ]
             .iter()
             .any(|word| is_keyword(&self.tokens[cursor], word))
         {
+            let directive_end = first_semicolon(self.tokens, cursor);
+            if is_keyword(&self.tokens[cursor], "external") {
+                is_external = true;
+                external_name =
+                    self.tokens[cursor + 1..directive_end]
+                        .windows(2)
+                        .find_map(|window| {
+                            if !is_keyword(&window[0], "name") {
+                                return None;
+                            }
+                            let TokenKind::String(name) = &window[1].kind else {
+                                return None;
+                            };
+                            Some(name.clone())
+                        });
+            }
             is_forward |= is_keyword(&self.tokens[cursor], "forward")
                 || is_keyword(&self.tokens[cursor], "external");
             overload |= is_keyword(&self.tokens[cursor], "overload");
@@ -1289,7 +1332,7 @@ impl<'a> DeclarationScanner<'a> {
             } else {
                 calling_convention
             };
-            cursor = (first_semicolon(self.tokens, cursor) + 1).min(self.tokens.len());
+            cursor = (directive_end + 1).min(self.tokens.len());
         }
 
         let mut body_declarations = Vec::new();
@@ -1339,6 +1382,8 @@ impl<'a> DeclarationScanner<'a> {
             body_tokens,
             has_body,
             is_forward,
+            is_external,
+            external_name,
             overload,
             class_method,
             static_method,

@@ -211,6 +211,12 @@ pub enum BoundExpressionKind {
         indices: Vec<BoundExpression>,
         binding: Option<Box<BoundPropertyBinding>>,
     },
+    RoutineDesignator {
+        routine: Box<BoundExpression>,
+        symbol: SymbolId,
+    },
+    ProcedureCode(Box<BoundExpression>),
+    Address(Box<BoundExpression>),
     Index {
         base: Box<BoundExpression>,
         indices: Vec<BoundExpression>,

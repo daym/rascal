@@ -429,7 +429,7 @@ fn indexed_and_default_properties_bind_accessor_contracts() {
 }
 
 #[test]
-fn bare_zero_argument_routines_call_only_in_application_contexts() {
+fn zero_argument_calls_and_explicit_routine_designators_are_distinct() {
     let source = "
         program AutoCalls;
         function Answer: LongInt;
@@ -439,18 +439,19 @@ fn bare_zero_argument_routines_call_only_in_application_contexts() {
         procedure Touch;
         begin
         end;
-        type TCallback = function: LongInt;
+        type
+          TCallback = function: LongInt;
         procedure Accept(Callback: TCallback);
         begin
         end;
         var Value: LongInt;
         var Callback: TCallback;
-        var Initialized: TCallback := Answer;
+        var Initialized: TCallback := @Answer;
         begin
           Value := Answer;
           Touch;
-          Callback := Answer;
-          Accept(Answer);
+          Callback := @Answer;
+          Accept(@Answer);
         end.
     ";
     let compilation = bind_sources(&[("auto_calls.pp", source)]);
@@ -479,7 +480,7 @@ fn bare_zero_argument_routines_call_only_in_application_contexts() {
     };
     assert!(matches!(
         callback.source.kind,
-        BoundExpressionKind::Symbol { .. }
+        BoundExpressionKind::RoutineDesignator { .. }
     ));
     let BoundStatementKind::Expression(accept) = &body.statements[3].kind else {
         panic!("expected procedure-designator argument")
@@ -489,8 +490,56 @@ fn bare_zero_argument_routines_call_only_in_application_contexts() {
     };
     assert!(matches!(
         operands[0].kind,
-        BoundExpressionKind::Symbol { .. }
+        BoundExpressionKind::RoutineDesignator { .. }
     ));
+}
+
+#[test]
+fn bare_routine_names_do_not_form_procedural_values() {
+    let source = "
+        program ExplicitRoutineAddress;
+        type
+          TCallback = function: LongInt;
+          TProcedure = procedure;
+        function Answer: LongInt;
+        begin
+          Answer := 42;
+        end;
+        procedure Touch;
+        begin
+        end;
+        var FunctionValue: TCallback;
+        var ProcedureValue: TProcedure;
+        begin
+          FunctionValue := Answer;
+          ProcedureValue := Touch;
+        end.
+    ";
+    let compilation = bind_sources(&[("explicit_routine_address.pp", source)]);
+    assert!(
+        compilation.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("procedural value requires explicit `@Routine`")
+        }),
+        "{:#?}",
+        compilation.diagnostics
+    );
+    let body = program_body(&compilation);
+    let BoundStatementKind::Assignment(function) = &body.statements[0].kind else {
+        panic!("expected function assignment")
+    };
+    assert!(matches!(
+        function.source.kind,
+        BoundExpressionKind::Application { .. }
+    ));
+    assert!(function.conversion.as_ref().is_some_and(|conversion| {
+        matches!(conversion.selection, ConversionSelection::NoViable)
+    }));
+    let BoundStatementKind::Assignment(procedure) = &body.statements[1].kind else {
+        panic!("expected procedure assignment")
+    };
+    assert_eq!(procedure.source.category, ExpressionCategory::Error);
 }
 
 #[test]

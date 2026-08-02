@@ -213,6 +213,9 @@ impl<'a> ConstantEvaluator<'a> {
             }
             BoundExpressionKind::Member { .. }
             | BoundExpressionKind::Property { .. }
+            | BoundExpressionKind::RoutineDesignator { .. }
+            | BoundExpressionKind::ProcedureCode(_)
+            | BoundExpressionKind::Address(_)
             | BoundExpressionKind::Index { .. }
             | BoundExpressionKind::Dereference(_)
             | BoundExpressionKind::Error => Err(ConstantEvaluationError::NotConstant),

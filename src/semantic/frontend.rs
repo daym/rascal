@@ -2161,13 +2161,9 @@ impl CompilationDriver {
         &mut self,
         expression: &Expr,
         owner: Option<TypeRef>,
-        expected: Option<TypeRef>,
+        _expected: Option<TypeRef>,
     ) -> BoundExpression {
-        if expected.is_some_and(|expected| self.binder.types.callable(expected).is_some()) {
-            self.bind_expression_without_implicit_call(expression, owner, SemanticUse::Value)
-        } else {
-            self.bind_expression(expression, owner)
-        }
+        self.bind_expression(expression, owner)
     }
 
     fn bind_expression_for(
@@ -2186,6 +2182,7 @@ impl CompilationDriver {
                 expression_modes(expression),
                 false,
             );
+            bound = self.reject_bare_routine_designator(bound);
         }
         if bound.category == ExpressionCategory::Error {
             return bound;
@@ -2221,19 +2218,35 @@ impl CompilationDriver {
         expression: &Expr,
         owner: Option<TypeRef>,
     ) -> BoundExpression {
-        let bound = self.bind_expression_for(expression, owner, SemanticUse::Value);
-        self.bind_implicit_zero_argument_call(bound, owner, expression_modes(expression), true)
+        let mut bound = self.bind_expression_raw(expression, owner);
+        bound.semantic_use = SemanticUse::Value;
+        bound = self.bind_property_use(bound, SemanticUse::Value, expression_modes(expression));
+        bound =
+            self.bind_implicit_zero_argument_call(bound, owner, expression_modes(expression), true);
+        self.reject_bare_routine_designator(bound)
     }
 
-    fn bind_expression_without_implicit_call(
+    fn reject_bare_routine_designator(
         &mut self,
-        expression: &Expr,
-        owner: Option<TypeRef>,
-        semantic_use: SemanticUse,
+        mut expression: BoundExpression,
     ) -> BoundExpression {
-        let mut bound = self.bind_expression_raw(expression, owner);
-        bound.semantic_use = semantic_use;
-        self.bind_property_use(bound, semantic_use, expression_modes(expression))
+        let routine = match &expression.kind {
+            BoundExpressionKind::Symbol { symbol, .. }
+            | BoundExpressionKind::Member { symbol, .. } => matches!(
+                self.binder.scopes.symbol(*symbol).kind,
+                SymbolKind::Routine(_)
+            ),
+            _ => false,
+        };
+        if routine {
+            self.diagnostics.push(Diagnostic::new(
+                expression.span.clone(),
+                "a procedural value requires explicit `@Routine` syntax",
+            ));
+            expression.ty = None;
+            expression.category = ExpressionCategory::Error;
+        }
+        expression
     }
 
     fn bind_implicit_zero_argument_call(
@@ -2821,18 +2834,9 @@ impl CompilationDriver {
             || bound_error(application.span.clone()),
             |target| self.bind_expression_for(target, owner, SemanticUse::AssignmentTarget),
         );
-        let expected_procedure = target
-            .ty
-            .is_some_and(|ty| self.binder.types.callable(ty).is_some());
         let mut source = operands.next().map_or_else(
             || bound_error(application.span.clone()),
-            |source| {
-                if expected_procedure {
-                    self.bind_expression_without_implicit_call(source, owner, SemanticUse::Value)
-                } else {
-                    self.bind_expression_for(source, owner, SemanticUse::Value)
-                }
-            },
+            |source| self.bind_expression_for(source, owner, SemanticUse::Value),
         );
         if operands.next().is_some() || application.operands.len() != 2 {
             self.diagnostics.push(Diagnostic::new(
@@ -2870,23 +2874,20 @@ impl CompilationDriver {
         application: &Application,
         owner: Option<TypeRef>,
     ) -> BoundExpression {
-        let operand_use = match application.callee {
-            Callee::Operator(Operator::Address | Operator::ProcedureSlotAddress) => {
-                SemanticUse::Address
-            }
-            _ => SemanticUse::Value,
-        };
+        let address_operator = matches!(
+            application.callee,
+            Callee::Operator(Operator::Address | Operator::ProcedureSlotAddress)
+        );
         let operands = application
             .operands
             .iter()
-            .enumerate()
-            .map(|(index, operand)| {
-                if operand_use == SemanticUse::Value
-                    && self.application_operand_expects_procedure_designator(application, index)
-                {
-                    self.bind_expression_without_implicit_call(operand, owner, SemanticUse::Value)
+            .map(|operand| {
+                if address_operator {
+                    let mut bound = self.bind_expression_raw(operand, owner);
+                    bound.semantic_use = SemanticUse::Address;
+                    bound
                 } else {
-                    self.bind_expression_for(operand, owner, operand_use)
+                    self.bind_expression_for(operand, owner, SemanticUse::Value)
                 }
             })
             .collect::<Vec<_>>();
@@ -2901,7 +2902,8 @@ impl CompilationDriver {
                         application.modes,
                     );
                 }
-                let callee = self.bind_expression(callee, owner);
+                let mut callee = self.bind_expression_raw(callee, owner);
+                callee = self.bind_property_use(callee, SemanticUse::Value, application.modes);
                 let candidate = self.application_candidate_from_callee(&callee);
                 let Some(candidate) = candidate else {
                     self.diagnostics.push(Diagnostic::new(
@@ -2960,58 +2962,6 @@ impl CompilationDriver {
                 operands,
                 application.modes,
             ),
-        }
-    }
-
-    fn application_operand_expects_procedure_designator(
-        &self,
-        application: &Application,
-        index: usize,
-    ) -> bool {
-        let Callee::Expression(callee) = &application.callee else {
-            return false;
-        };
-        let ExprKind::Identifier(spelling) = &callee.kind else {
-            return false;
-        };
-        let Some(name) = self.binder.scopes.names().lookup(spelling) else {
-            return false;
-        };
-        let Some(lookup) = self.binder.scopes.lookup_symbol(
-            self.binder.scopes.current_environment(),
-            name,
-            LookupRequest::ORDINARY,
-        ) else {
-            return false;
-        };
-        match self.binder.scopes.symbol(lookup.primary[0].symbol).kind {
-            SymbolKind::Type(destination) => {
-                index == 0 && self.binder.types.callable(destination).is_some()
-            }
-            SymbolKind::Routine(_) => {
-                let mut found = false;
-                for hit in &lookup.primary {
-                    let SymbolKind::Routine(callable_type) =
-                        self.binder.scopes.symbol(hit.symbol).kind
-                    else {
-                        continue;
-                    };
-                    let Some(formal) = self
-                        .binder
-                        .types
-                        .callable(callable_type)
-                        .and_then(|callable| callable.signature.parameters.get(index))
-                    else {
-                        return false;
-                    };
-                    if self.binder.types.callable(formal.ty).is_none() {
-                        return false;
-                    }
-                    found = true;
-                }
-                found
-            }
-            _ => false,
         }
     }
 
@@ -3198,6 +3148,9 @@ impl CompilationDriver {
         operands: Vec<BoundExpression>,
         modes: crate::ModeSnapshot,
     ) -> BoundExpression {
+        if matches!(operator, Operator::Address | Operator::ProcedureSlotAddress) {
+            return self.bind_address_application(operator, span, operands, modes);
+        }
         if operator == Operator::Assign {
             self.diagnostics.push(Diagnostic::new(
                 span.clone(),
@@ -3297,6 +3250,115 @@ impl CompilationDriver {
         }
     }
 
+    fn bind_address_application(
+        &mut self,
+        operator: Operator,
+        span: Span,
+        mut operands: Vec<BoundExpression>,
+        modes: crate::ModeSnapshot,
+    ) -> BoundExpression {
+        if operands.len() != 1 {
+            self.diagnostics.push(Diagnostic::new(
+                span.clone(),
+                "address syntax requires exactly one operand",
+            ));
+            return bound_application_error(span, operands, modes);
+        }
+        let operand = operands.pop().unwrap();
+        let routine_symbol = match &operand.kind {
+            BoundExpressionKind::Symbol { symbol, .. }
+            | BoundExpressionKind::Member { symbol, .. }
+                if matches!(
+                    self.binder.scopes.symbol(*symbol).kind,
+                    SymbolKind::Routine(_)
+                ) =>
+            {
+                Some(*symbol)
+            }
+            _ => None,
+        };
+        if let Some(symbol) = routine_symbol {
+            if operator == Operator::ProcedureSlotAddress {
+                self.diagnostics.push(Diagnostic::new(
+                    span.clone(),
+                    "`@@` requires procedural-variable storage, not a routine declaration",
+                ));
+                return bound_application_error(span, vec![operand], modes);
+            }
+            let ty = self.binder.scopes.symbol(symbol).kind.ty();
+            if ty
+                .and_then(|ty| self.binder.types.callable(ty))
+                .is_some_and(|callable| callable.flavor == CallableFlavor::Nested)
+            {
+                self.diagnostics.push(Diagnostic::new(
+                    span.clone(),
+                    "nested routines cannot be converted to procedural values",
+                ));
+                return bound_application_error(span, vec![operand], modes);
+            }
+            return BoundExpression {
+                kind: BoundExpressionKind::RoutineDesignator {
+                    routine: Box::new(operand),
+                    symbol,
+                },
+                ty,
+                category: ExpressionCategory::Value,
+                semantic_use: SemanticUse::Value,
+                conversion: None,
+                span,
+            };
+        }
+
+        let Some(operand_type) = operand.ty else {
+            self.diagnostics.push(Diagnostic::new(
+                span.clone(),
+                "address operand has no semantic type",
+            ));
+            return bound_application_error(span, vec![operand], modes);
+        };
+        if operator == Operator::Address
+            && operand.category.is_addressable()
+            && self.binder.types.callable(operand_type).is_some()
+        {
+            return BoundExpression {
+                kind: BoundExpressionKind::ProcedureCode(Box::new(operand)),
+                ty: Some(operand_type),
+                category: ExpressionCategory::Value,
+                semantic_use: SemanticUse::Value,
+                conversion: None,
+                span,
+            };
+        }
+        if !operand.category.is_addressable() {
+            self.diagnostics.push(Diagnostic::new(
+                span.clone(),
+                "address operand is not storage",
+            ));
+            return bound_application_error(span, vec![operand], modes);
+        }
+        if operator == Operator::ProcedureSlotAddress
+            && self.binder.types.callable(operand_type).is_none()
+        {
+            self.diagnostics.push(Diagnostic::new(
+                span.clone(),
+                "`@@` requires procedural-variable storage",
+            ));
+            return bound_application_error(span, vec![operand], modes);
+        }
+        let pointer = self.allocate_anonymous(PointerType {
+            target: operand_type,
+            layout: pointer_layout(),
+        });
+        BoundExpression {
+            kind: BoundExpressionKind::Address(Box::new(operand)),
+            ty: Some(pointer),
+            category: ExpressionCategory::Value,
+            semantic_use: SemanticUse::Value,
+            conversion: None,
+            span,
+        }
+    }
+
     fn application_candidate_from_callee(
         &self,
         callee: &BoundExpression,
@@ -3304,6 +3366,9 @@ impl CompilationDriver {
         let (symbol, lookup_receiver, explicit_receiver) = match &callee.kind {
             BoundExpressionKind::Symbol { symbol, receiver } => (Some(*symbol), *receiver, false),
             BoundExpressionKind::Member { symbol, .. } => (Some(*symbol), None, true),
+            BoundExpressionKind::RoutineDesignator { routine, .. } => {
+                return self.application_candidate_from_callee(routine);
+            }
             _ => (None, None, false),
         };
         let callable_type = callee.ty?;
